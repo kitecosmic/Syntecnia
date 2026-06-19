@@ -52,6 +52,32 @@ MEM_SPILL = 1_048_576  # 1 MB
 # Default cap on concurrent SSE streams (each holds a thread in this model).
 DEFAULT_MAX_STREAMS = 100
 
+# Content-types pinned for static serving so the result never depends on the
+# host's mimetypes registry (e.g. Windows maps .js → text/plain). stdlib only.
+_WEB_CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".htm": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".map": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".ico": "image/x-icon",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".txt": "text/plain; charset=utf-8",
+    ".xml": "application/xml; charset=utf-8",
+    ".wasm": "application/wasm",
+    ".pdf": "application/pdf",
+}
+
 
 class ClientGone(BaseException):
     """
@@ -409,17 +435,24 @@ class ServeRuntime:
                  auth_handler: Optional[Callable[[str], Optional[SynValue]]] = None,
                  host: str = "0.0.0.0", max_body: Optional[int] = MAX_BODY,
                  max_streams: int = DEFAULT_MAX_STREAMS,
-                 static_dir: Optional[str] = None,
+                 static_mounts: Optional[List[Tuple[str, str]]] = None,
                  cors_origin: Optional[str] = None):
         self.port = int(port)
         self.host = host
-        self.routes = routes
+        # Routes are matched by specificity, NOT declaration order, so a
+        # catch-all or :param can never swallow a more specific route. Sorting
+        # once here means _match can just return the first matching route.
+        self.routes = sorted(routes, key=lambda r: self._specificity(r.path))
         self.auth_handler = auth_handler
         self.max_body = max_body  # bytes, or None for unlimited
         self.max_streams = int(max_streams)
-        # Static file root (realpath) — declared via `static "./dir"`. Its mere
-        # declaration is the permission to read from it (no file() capability).
-        self.static_dir = os.path.realpath(static_dir) if static_dir else None
+        # Static mounts — declared via `static "./dir"` (root) or
+        # `static "/prefix" from "./dir"`. Each is (url_prefix, realpath_dir);
+        # the declaration is the read permission (no file() capability). Longer
+        # prefixes are tried first so a mounted dir wins over the root mount.
+        mounts = [(self._norm_prefix(p), os.path.realpath(d))
+                  for p, d in (static_mounts or [])]
+        self.static_mounts = sorted(mounts, key=lambda m: len(m[0]), reverse=True)
         # CORS origin — declared via `cors "*"` / `cors "https://app.com"`.
         self.cors_origin = cors_origin
         self.httpd: Optional[ThreadingHTTPServer] = None
@@ -445,21 +478,54 @@ class ServeRuntime:
     # -- matching --
 
     @staticmethod
+    def _specificity(pattern: str) -> List[int]:
+        """
+        Rank a pattern's segments for precedence: static(0) < :param(1) < *catchall(2).
+        Sorting routes by this list ascending puts the most specific first, so a
+        catch-all never wins over an exact or :param match for the same path.
+        """
+        ranks = []
+        for seg in (s for s in pattern.split("/") if s != ""):
+            if seg.startswith("*"):
+                ranks.append(2)
+            elif seg.startswith(":"):
+                ranks.append(1)
+            else:
+                ranks.append(0)
+        return ranks
+
+    @staticmethod
     def _path_match(pattern: str, path: str) -> Optional[Dict[str, str]]:
-        """Return captured params if `path` matches `pattern`, else None."""
+        """Return captured params if `path` matches `pattern`, else None.
+
+        A `*name` segment is a catch-all: it must be last and captures the rest
+        of the path (one or more segments) as `name`, joined by '/'.
+        """
         actual = [s for s in path.split("/") if s != ""]
         segs = [s for s in pattern.split("/") if s != ""]
-        if len(segs) != len(actual):
-            return None
         params: Dict[str, str] = {}
-        for pat_seg, act_seg in zip(segs, actual):
+        for i, pat_seg in enumerate(segs):
+            if pat_seg.startswith("*"):
+                # Catch-all: needs at least one remaining segment.
+                rest = actual[i:]
+                if not rest:
+                    return None
+                params[pat_seg[1:]] = "/".join(unquote(s) for s in rest)
+                return params
+            if i >= len(actual):
+                return None
+            act_seg = actual[i]
             if pat_seg.startswith(":"):
                 params[pat_seg[1:]] = unquote(act_seg)
             elif pat_seg != act_seg:
                 return None
+        # No catch-all consumed the tail: lengths must match exactly.
+        if len(actual) != len(segs):
+            return None
         return params
 
     def _match(self, method: str, path: str) -> Tuple[Optional[RouteSpec], Dict[str, str]]:
+        # self.routes is pre-sorted by specificity, so the first match wins.
         for route in self.routes:
             if route.method != method:
                 continue
@@ -470,32 +536,54 @@ class ServeRuntime:
 
     # -- static files --
 
-    def _resolve_static(self, url_path: str) -> Optional[str]:
-        """
-        Map a URL path to a safe file inside static_dir, or None.
+    @staticmethod
+    def _norm_prefix(prefix: Optional[str]) -> str:
+        """Normalize a mount prefix to '/' or '/seg/.../' (always trailing-slashed)."""
+        if not prefix or prefix == "/":
+            return "/"
+        p = "/" + prefix.strip("/")
+        return p + "/"
 
-        Blocks path traversal: the resolved real path must stay within the real
-        static root (defeats `../`, absolute paths, and symlinks escaping the dir).
-        '/' maps to index.html.
+    @staticmethod
+    def _within(base: str, target: str) -> bool:
+        return target == base or target.startswith(base + os.sep)
+
+    @classmethod
+    def _resolve_in(cls, base: str, rel: str) -> Optional[str]:
         """
-        if not self.static_dir:
-            return None
-        rel = unquote(url_path).lstrip("/")
+        Resolve `rel` to a real file inside `base`, or None.
+
+        Blocks path traversal: the resolved real path must stay within `base`
+        (defeats `../`, absolute paths, and symlinks escaping the dir). An empty
+        path or a directory resolves to its `index.html` when present.
+        """
+        rel = unquote(rel).lstrip("/")
         if rel == "":
             rel = "index.html"
         # An absolute path (or one os.path.join would treat as absolute) can't be
         # inside a relative request — reject outright before joining.
         if os.path.isabs(rel) or (len(rel) > 1 and rel[1] == ":"):
             return None
-        target = os.path.realpath(os.path.join(self.static_dir, rel))
-        if target != self.static_dir and not target.startswith(self.static_dir + os.sep):
+        target = os.path.realpath(os.path.join(base, rel))
+        if not cls._within(base, target):
             return None
+        if os.path.isdir(target):
+            # Subfolder index: /docs/ → <base>/docs/index.html
+            target = os.path.realpath(os.path.join(target, "index.html"))
+            if not cls._within(base, target):
+                return None
         if not os.path.isfile(target):
             return None
         return target
 
     @staticmethod
     def _static_content_type(path: str) -> str:
+        # Pin the common web types so the result is predictable across hosts —
+        # the OS mimetypes registry can map .js to text/plain (Windows), which
+        # breaks JS modules in the browser. Fall back to mimetypes otherwise.
+        ext = os.path.splitext(path)[1].lower()
+        if ext in _WEB_CONTENT_TYPES:
+            return _WEB_CONTENT_TYPES[ext]
         import mimetypes
         ctype, _enc = mimetypes.guess_type(path)
         if ctype is None:
@@ -505,17 +593,32 @@ class ServeRuntime:
         return ctype
 
     def serve_static(self, url_path: str) -> Optional[RawResponse]:
-        """Return a RawResponse for a static file under static_dir, or None."""
-        target = self._resolve_static(url_path)
-        if target is None:
-            return None
-        try:
-            with open(target, "rb") as f:
-                data = f.read()
-        except OSError:
-            return None
-        return RawResponse(body=data, content_type=self._static_content_type(target),
-                           status=200)
+        """Return a RawResponse for a static file from a matching mount, or None.
+
+        Mounts are tried longest-prefix-first; each enforces its own traversal
+        protection against its own root.
+        """
+        for prefix, base in self.static_mounts:
+            if prefix == "/":
+                rel = url_path
+            elif url_path == prefix.rstrip("/"):
+                rel = ""                       # bare mount point → its index.html
+            elif url_path.startswith(prefix):
+                rel = url_path[len(prefix):]
+            else:
+                continue
+            target = self._resolve_in(base, rel)
+            if target is None:
+                continue
+            try:
+                with open(target, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            return RawResponse(body=data,
+                               content_type=self._static_content_type(target),
+                               status=200)
+        return None
 
     def methods_for_path(self, path: str) -> List[str]:
         """Methods of all routes whose path pattern matches (for 405 / Allow / OPTIONS)."""
@@ -574,9 +677,9 @@ class ServeRuntime:
                     {"Allow": ", ".join(allowed)},
                     None,
                 )
-            # No declared route at all: a GET/HEAD may be served from the static
-            # root, if one is configured. (HEAD reaches here as method "GET".)
-            if method == "GET" and self.static_dir:
+            # No declared route at all: a GET/HEAD may be served from a static
+            # mount, if any is configured. (HEAD reaches here as method "GET".)
+            if method == "GET" and self.static_mounts:
                 raw = self.serve_static(path)
                 if raw is not None:
                     return raw.status, raw, {}, None

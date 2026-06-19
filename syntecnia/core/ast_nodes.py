@@ -457,6 +457,16 @@ class RateLimitClause(Node):
     unlimited: bool = False              # `rate_limit none` / `unlimited`
 
 @dataclass
+class StaticMount(Node):
+    """
+    A static-file mount inside a serve block:
+        static "./public"               -- prefix is None → mounted at "/"
+        static "/assets" from "./assets" -- mounted under the "/assets" prefix
+    """
+    directory: Node = None               # expression: directory to serve from
+    prefix: Optional[Node] = None        # expression: URL prefix, or None for "/"
+
+@dataclass
 class ServeBlock(Node):
     """
     serve on 8080
@@ -469,7 +479,7 @@ class ServeBlock(Node):
     max_body: Optional[Node] = None      # expression: max request body ("10mb"/bytes/"unlimited")
     max_streams: Optional[Node] = None   # expression: max concurrent SSE streams
     rate_limit: Optional['RateLimitClause'] = None  # default rate limit for all routes
-    static_dir: Optional[Node] = None    # expression: directory to serve static files from
+    static_mounts: List['StaticMount'] = field(default_factory=list)  # static file mounts
     cors: Optional[Node] = None          # expression: CORS origin ("*" or "https://app.com")
     routes: List[RouteDefinition] = field(default_factory=list)
 

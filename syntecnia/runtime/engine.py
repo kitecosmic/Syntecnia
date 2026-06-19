@@ -374,10 +374,26 @@ class SyntecniaEngine:
                 rate_limit=eff_rate, rate_zone=zone,
             ))
 
-        # Resolve the static-file root and CORS origin once (if declared).
-        static_dir = None
-        if node.static_dir is not None:
-            static_dir = str(self.interpreter._exec(node.static_dir, serve_env).raw)
+        # Resolve the static mounts and CORS origin once (if declared). Each
+        # mount is (url_prefix, directory); prefix None means the root "/".
+        static_mounts = []
+        seen_prefixes = set()
+        for mount in node.static_mounts:
+            directory = str(self.interpreter._exec(mount.directory, serve_env).raw)
+            if mount.prefix is None:
+                prefix = "/"
+            else:
+                prefix = str(self.interpreter._exec(mount.prefix, serve_env).raw)
+            key = "/" + prefix.strip("/")  # normalize for the duplicate check
+            if key in seen_prefixes:
+                raise SynRuntimeError(
+                    f"two static mounts at the same prefix {prefix!r}; mount each "
+                    f"at a distinct prefix (e.g. static \"/assets\" from \"./assets\")",
+                    node.location,
+                )
+            seen_prefixes.add(key)
+            static_mounts.append((prefix, directory))
+
         cors_origin = None
         if node.cors is not None:
             cors_origin = str(self.interpreter._exec(node.cors, serve_env).raw)
@@ -385,7 +401,7 @@ class SyntecniaEngine:
         runtime = ServeRuntime(
             port_num, routes, auth_handler=_auth_runner,
             max_body=max_body, max_streams=max_streams,
-            static_dir=static_dir, cors_origin=cors_origin,
+            static_mounts=static_mounts, cors_origin=cors_origin,
         )
         try:
             runtime.start(background=True)

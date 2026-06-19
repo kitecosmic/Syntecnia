@@ -397,6 +397,9 @@ def test_soft_keyword_static_as_variable():
 def test_soft_keyword_cors_as_variable():
     assert_output('let cors be 2\nprint(cors)', ['2'])
 
+def test_soft_keyword_from_as_variable():
+    assert_output('let from be 3\nprint(from)', ['3'])
+
 
 # -- Reserved (hard) keywords give a clear error --
 

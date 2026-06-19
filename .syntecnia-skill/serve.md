@@ -35,16 +35,34 @@ serve on 8080
   and returns immediately. The CLI keeps the process alive while servers run.
 - `route "METHOD /path"` defines a handler. The body is ordinary Syntecnia.
 - Named path params use `:name` → `route "GET /products/:id"`.
+- A trailing **catch-all** `*name` captures the rest of the path (variable depth)
+  → `route "GET /files/*path"` matches `/files/a/b/c` with `params.path == "a/b/c"`.
+  It must be the last segment and needs at least one segment to capture.
+
+### Route precedence (by specificity, not order)
+
+When several routes could match the same path, the **most specific** wins —
+regardless of declaration order, so a `:param` or catch-all can never accidentally
+swallow a more specific route:
+
+```
+exact segment  >  :param  >  *catchall
+```
+
+`route "GET /files/special"` beats `route "GET /files/:id"` beats
+`route "GET /files/*path"` for `/files/special`, even if the catch-all is declared
+first.
 
 ### Soft keywords
 
 `serve`, `on`, `route`, `auth`, `requires`, `expect`, `max_body`, `max_streams`,
-`stream`, `send`, `rate_limit`, `per`, `static` and `cors` are **soft keywords**:
-they are special *only* at the start of their construction (`serve on N`,
-`route "..."`, `requires auth`, `expect body {...}`, `max_body "10mb"`,
-`max_streams N`, a `stream` block, `send` inside one, `rate_limit N per window`,
-`static "./dir"`, `cors "*"`). Everywhere else they are ordinary names —
-`let route be "/x"`, `let static be 1` and `task auth(x)` are valid. The parser
+`stream`, `send`, `rate_limit`, `per`, `static`, `from` and `cors` are **soft
+keywords**: they are special *only* at the start of their construction
+(`serve on N`, `route "..."`, `requires auth`, `expect body {...}`,
+`max_body "10mb"`, `max_streams N`, a `stream` block, `send` inside one,
+`rate_limit N per window`, `static "./dir"`, `static "/p" from "./dir"`,
+`cors "*"`). Everywhere else they are ordinary names — `let route be "/x"`,
+`let static be 1`, `let from be 3` and `task auth(x)` are valid. The parser
 decides with fixed lookahead, never heuristics.
 
 ## The request
@@ -133,31 +151,38 @@ route "GET /legacy"
   `respond(x, "text/plain")` (the `text(...)` builtin is value conversion, not a
   response helper).
 
-### Static files — `static "./dir"`
+### Static files — `static "./dir"` (and mounts)
 
 Declare a directory and any GET/HEAD that doesn't match a declared route is served
-from it:
+from it. You can mount several dirs, each at its own URL prefix:
 
 ```
 serve on 8090
-    static "./public"            -- serve files from ./public; "/" → index.html
-    route "POST /api/signup"     -- declared routes ALWAYS win over static
+    static "./public"                 -- root mount: "/" → ./public/index.html
+    static "/assets" from "./assets"  -- mount ./assets under the "/assets" prefix
+    route "POST /api/signup"          -- declared routes ALWAYS win over static
         ...
 ```
 
 - A `GET`/`HEAD` with no matching route falls through to the static handler:
-  `./public/<path>` is served with a content-type guessed from its extension
-  (`.html`, `.css`, `.js`, `.png`, `.svg`, `.json`, …); `/` serves `index.html`;
-  a missing file → `404` JSON.
+  the file is served with a content-type from its extension (`.html`, `.css`,
+  `.js`, `.png`, `.svg`, `.json`, … — these common web types are **pinned** so the
+  result doesn't depend on the host's mime registry); a missing file → `404` JSON.
+- **Directory index.** `/` serves `index.html`; a subfolder serves its
+  `index.html` too — `/docs/` (and `/docs`) → `<dir>/docs/index.html`.
+- **Multiple mounts.** `static "./dir"` mounts at the root; `static "/p" from
+  "./dir"` mounts under `/p`. Longer prefixes are matched first, so `/assets/...`
+  is served from the `/assets` mount before the root mount is tried. Declaring two
+  mounts at the **same** prefix is an **error** (no silent shadowing).
 - **Declared routes always win.** If a path is declared (for any method) it is
   never shadowed by a file — a different method on it gets `405`, not a file.
 - **Only `GET`/`HEAD`.** A `POST` to a static path is not served (→ `404`/`405`).
 - **The declaration is the permission.** `static "./public"` grants reading from
-  that directory; you do **not** also need a `file()` capability for it. The path
-  is relative to the program's working directory.
-- **Path traversal is blocked.** `../`, encoded `..%2f`, absolute paths and
-  symlinks escaping the directory are rejected — the resolved real path must stay
-  inside the static root.
+  that directory; you do **not** also need a `file()` capability for it. Relative
+  paths are resolved against the program's working directory.
+- **Path traversal is blocked, per mount.** `../`, encoded `..%2f`, absolute paths
+  and symlinks escaping the directory are rejected — the resolved real path must
+  stay inside that mount's root.
 
 > **Same-origin tip:** if the landing page is served by `static` from the same
 > server as the API, the browser's `fetch` is **same-origin** and needs no CORS.

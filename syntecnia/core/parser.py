@@ -618,7 +618,7 @@ class Parser:
         max_body = None
         max_streams = None
         rate_limit = None
-        static_dir = None
+        static_mounts = []
         cors = None
         routes = []
 
@@ -641,7 +641,15 @@ class Parser:
                 rate_limit = self._parse_rate_limit()
             elif self._check_word("static"):
                 self._advance()  # consume soft keyword 'static'
-                static_dir = self._parse_expression()
+                first = self._parse_expression()
+                if self._check_word("from"):
+                    self._advance()  # consume soft keyword 'from'
+                    directory = self._parse_expression()
+                    static_mounts.append(ast.StaticMount(
+                        location=loc, prefix=first, directory=directory))
+                else:
+                    static_mounts.append(ast.StaticMount(
+                        location=loc, prefix=None, directory=first))
             elif self._check_word("cors"):
                 self._advance()  # consume soft keyword 'cors'
                 cors = self._parse_expression()
@@ -672,7 +680,7 @@ class Parser:
         return ast.ServeBlock(
             location=loc, port=port, auth_handler=auth_handler,
             max_body=max_body, max_streams=max_streams,
-            rate_limit=rate_limit, static_dir=static_dir, cors=cors,
+            rate_limit=rate_limit, static_mounts=static_mounts, cors=cors,
             routes=routes,
         )
 
@@ -747,7 +755,12 @@ class Parser:
         return ast.SendStatement(location=loc, value=value, event_name=event_name)
 
     def _split_route_spec(self, spec: str, loc) -> tuple:
-        """Parse 'GET /products/:id' → ('GET', '/products/:id', ['id'])."""
+        """
+        Parse 'GET /products/:id' → ('GET', '/products/:id', ['id']).
+
+        Supports a single trailing catch-all segment: 'GET /files/*path' captures
+        the rest of the path (variable depth) as `params.path`.
+        """
         parts = spec.strip().split(None, 1)
         if len(parts) != 2:
             raise ParseError(
@@ -757,10 +770,20 @@ class Parser:
         path = parts[1].strip()
         if not path.startswith("/"):
             raise ParseError(f"Route path must start with '/', got {path!r}", loc)
-        param_names = [
-            seg[1:] for seg in path.split("/")
-            if seg.startswith(":") and len(seg) > 1
-        ]
+        segs = [s for s in path.split("/") if s != ""]
+        param_names = []
+        for i, seg in enumerate(segs):
+            if seg.startswith(":") and len(seg) > 1:
+                param_names.append(seg[1:])
+            elif seg.startswith("*"):
+                if len(seg) == 1:
+                    raise ParseError(
+                        f"Catch-all segment must be named, e.g. '*path', got {seg!r}", loc)
+                if i != len(segs) - 1:
+                    raise ParseError(
+                        f"Catch-all '*{seg[1:]}' must be the LAST segment of the path, "
+                        f"got {path!r}", loc)
+                param_names.append(seg[1:])
         return method, path, param_names
 
     def _parse_expect(self) -> ast.ExpectStatement:

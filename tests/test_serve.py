@@ -1474,6 +1474,209 @@ serve on __PORT__
         assert headers.get("Access-Control-Allow-Origin") is None
 
 
+# ===== MODULE A: Next-parity routing =====
+
+# -- A1: catch-all routes + specificity precedence --
+
+def test_catch_all_captures_rest_of_path():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /files/*path"
+        give {"path": params.path}
+"""
+    with serving(prog) as req:
+        assert req("GET", "/files/a/b/c") == (200, {"path": "a/b/c"})
+        assert req("GET", "/files/single") == (200, {"path": "single"})
+
+
+def test_catch_all_url_decodes_segments():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /files/*path"
+        give {"path": params.path}
+"""
+    with serving(prog) as req:
+        status, body = req("GET", "/files/a%20b/c")
+        assert body == {"path": "a b/c"}
+
+
+def test_catch_all_requires_at_least_one_segment():
+    # Bare /files has nothing for *path to capture → no match → 404.
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /files/*path"
+        give {"path": params.path}
+"""
+    with serving(prog) as req:
+        status, body = req("GET", "/files")
+        assert status == 404
+
+
+def test_exact_route_wins_over_catch_all():
+    # Precedence is by specificity, NOT declaration order: the catch-all is
+    # declared first but the exact route still wins.
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /files/*path"
+        give {"catch": params.path}
+    route "GET /files/special"
+        give {"exact": true}
+"""
+    with serving(prog) as req:
+        assert req("GET", "/files/special") == (200, {"exact": True})
+        assert req("GET", "/files/other") == (200, {"catch": "other"})
+
+
+def test_param_route_wins_over_catch_all():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /files/*path"
+        give {"catch": params.path}
+    route "GET /files/:id"
+        give {"id": params.id}
+"""
+    with serving(prog) as req:
+        # Single segment → :id (more specific) wins over the catch-all.
+        assert req("GET", "/files/42") == (200, {"id": "42"})
+        # Deeper path → only the catch-all matches.
+        assert req("GET", "/files/42/extra") == (200, {"catch": "42/extra"})
+
+
+def test_catch_all_must_be_last_segment_parse_error():
+    engine = SyntecniaEngine()
+    result = engine.run_source(
+        'require serve(8150)\n'
+        'serve on 8150\n'
+        '    route "GET /files/*rest/more"\n'
+        '        give {"ok": true}',
+        filename="badcatch.syn",
+    )
+    assert not result.success
+    assert any("LAST segment" in e for e in result.errors)
+    engine.shutdown_servers()
+
+
+# -- A2: index in static subfolders --
+
+@contextlib.contextmanager
+def _dirs(spec: dict):
+    """spec: {"rel/path": content}. Yields the base dir (forward slashes)."""
+    base = tempfile.mkdtemp(prefix="syn_modA_test_")
+    for rel, content in spec.items():
+        path = os.path.join(base, *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+    try:
+        yield base.replace("\\", "/")
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_static_subfolder_index():
+    files = {"public/index.html": "<h1>root</h1>",
+             "public/docs/index.html": "<h1>docs</h1>"}
+    with _dirs(files) as base:
+        prog = f"""
+require serve(__PORT__)
+serve on __PORT__
+    static "{base}/public"
+    route "GET /api/ping"
+        give {{"ok": true}}
+"""
+        with serving(prog) as req:
+            # Both /docs/ and /docs resolve to the subfolder index.
+            for path in ("/docs/", "/docs"):
+                status, headers, raw = req.raw("GET", path)
+                assert status == 200, path
+                assert raw == b"<h1>docs</h1>"
+            # Root still serves the top index.
+            status, headers, raw = req.raw("GET", "/")
+            assert raw == b"<h1>root</h1>"
+
+
+def test_static_js_content_type_is_pinned():
+    # Predictable content-type regardless of the host mimetypes registry.
+    with _dirs({"public/app.js": "console.log(1)"}) as base:
+        prog = f"""
+require serve(__PORT__)
+serve on __PORT__
+    static "{base}/public"
+    route "GET /api/ping"
+        give {{"ok": true}}
+"""
+        with serving(prog) as req:
+            status, headers, raw = req.raw("GET", "/app.js")
+            assert status == 200
+            assert headers.get("Content-Type") == "text/javascript; charset=utf-8"
+
+
+# -- A3: multiple static mounts --
+
+def test_multiple_static_mounts():
+    files = {"public/index.html": "<h1>root</h1>",
+             "assets/app.css": "body{}"}
+    with _dirs(files) as base:
+        prog = f"""
+require serve(__PORT__)
+serve on __PORT__
+    static "{base}/public"
+    static "/assets" from "{base}/assets"
+    route "GET /api/ping"
+        give {{"ok": true}}
+"""
+        with serving(prog) as req:
+            status, headers, raw = req.raw("GET", "/")
+            assert raw == b"<h1>root</h1>"
+            status, headers, raw = req.raw("GET", "/assets/app.css")
+            assert status == 200
+            assert raw == b"body{}"
+            assert headers.get("Content-Type", "").startswith("text/css")
+
+
+def test_static_mount_traversal_blocked_per_mount():
+    secret = "MOUNT-LEAK"
+    files = {"assets/app.css": "body{}", "secret.txt": secret}
+    with _dirs(files) as base:
+        prog = f"""
+require serve(__PORT__)
+serve on __PORT__
+    static "/assets" from "{base}/assets"
+    route "GET /api/ping"
+        give {{"ok": true}}
+"""
+        with serving(prog) as req:
+            for path in ("/assets/../secret.txt", "/assets/..%2f..%2fsecret.txt"):
+                status, headers, raw = req.raw("GET", path)
+                assert secret.encode() not in raw, path
+                assert status == 404, path
+
+
+def test_two_static_at_same_root_is_error():
+    files = {"a/x.html": "a", "b/y.html": "b"}
+    with _dirs(files) as base:
+        port = _free_port()
+        engine = SyntecniaEngine()
+        result = engine.run_source(
+            f'require serve({port})\n'
+            f'serve on {port}\n'
+            f'    static "{base}/a"\n'
+            f'    static "{base}/b"\n'
+            f'    route "GET /x"\n'
+            f'        give {{"ok": true}}',
+            filename="duproot.syn",
+        )
+        assert not result.success
+        assert len(engine.servers) == 0
+        assert any("same prefix" in e for e in result.errors)
+        engine.shutdown_servers()
+
+
 if __name__ == "__main__":
     test_functions = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     passed = 0

@@ -17,13 +17,14 @@ Literals: `true`, `false`, `nothing`
 
 ## Soft keywords (NOT reserved)
 `serve`, `on`, `route`, `auth`, `requires`, `expect`, `max_body`, `max_streams`,
-`stream`, `send`, `rate_limit`, `per`, `static`, `cors` — special **only** at the
-start of their HTTP-server construction (`serve on N`, `route "..."`,
+`stream`, `send`, `rate_limit`, `per`, `static`, `from`, `cors` — special **only**
+at the start of their HTTP-server construction (`serve on N`, `route "..."`,
 `requires auth`, `expect body {...}`, `max_body "10mb"`, `max_streams N`, a
 `stream` block, `send` inside one, `rate_limit N per window`, `static "./dir"`,
-`cors "*"`). Everywhere else they are ordinary identifiers, so `let route be "/x"`,
-`let static be 1` and `task auth(x)` are valid. The parser uses fixed lookahead,
-never heuristics. See [serve.md](serve.md).
+`static "/p" from "./dir"`, `cors "*"`). Everywhere else they are ordinary
+identifiers, so `let route be "/x"`, `let static be 1`, `let from be 3` and
+`task auth(x)` are valid. The parser uses fixed lookahead, never heuristics. See
+[serve.md](serve.md).
 
 ## Operators
 Arithmetic: `+`, `-`, `*`, `/`, `%`, `**`

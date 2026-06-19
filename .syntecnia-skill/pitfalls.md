@@ -50,6 +50,10 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 | `static "./public"` also needs `require file(...)` | No — the `static` declaration **is** the read permission for that dir | Just declare `static "./public"`; the path is relative to the working dir |
 | `cors "*"` works with `Authorization`/cookies | The CORS spec forbids `*` for credentialed requests | Use a specific origin: `cors "https://app.example.com"` |
 | A static file shadows my declared route | Declared routes always win; static is only the fallback | Expected — rename the file or the route if you really want the file |
+| A catch-all `*path` swallows a more specific route | Precedence is by specificity, not order: exact > `:param` > `*catchall` | Expected — the exact/`:param` route wins even if declared after the catch-all |
+| `route "GET /files/*path"` matches bare `/files` | A catch-all needs ≥1 segment to capture | Add `route "GET /files"` if you want to handle the bare path |
+| Two `static "./a"` / `static "./b"` (both root) | Silent shadowing is now a startup **error** | Mount one under a prefix: `static "/b" from "./b"` |
+| `*rest` not the last path segment | Parse error — a catch-all must be last | Put `*name` as the final segment: `/files/*path` |
 
 ### Anti-patterns
 
