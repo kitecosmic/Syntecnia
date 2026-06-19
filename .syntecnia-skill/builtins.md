@@ -88,6 +88,15 @@ Response helpers (set the HTTP status; body follows the response contract):
 - `respond(content, content_type, status?)` → raw body with an arbitrary content-type and optional status
 - `read_body()` → full request body text (from memory or the temp file) — inside a route handler
 
+### Semantic content (negotiated HTML / Markdown / JSON — see serve.md)
+- `content(tree)` → a negotiable response: HTML (default), Markdown (`Accept: text/markdown` or `.md`), or JSON (`.json`). Opt-in; only `content()` is negotiated.
+- `page(nodes, meta?)` → document root; `meta` map (`title`, `description`) feeds `<head>` + JSON-LD
+- `heading(level, text)`, `prose(text)`
+- `list(items)`, `ordered_list(items)` — items may be text or nodes
+- `link(text, href)`, `image(src, alt)`
+- `section(nodes)`, `code(text, lang?)`
+- `raw(html)` → raw HTML escape hatch (NOT auto-escaped); everything else in HTML output IS auto-escaped (XSS-safe)
+
 ## Cron (Scheduled Tasks)
 - `cron_every(seconds, task)` → job name (repeating background job)
 - `cron_after(seconds, task)` → job name (one-shot delayed execution)

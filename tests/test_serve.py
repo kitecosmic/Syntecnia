@@ -1677,6 +1677,167 @@ def test_two_static_at_same_root_is_error():
         engine.shutdown_servers()
 
 
+# ===== MODULE B1b/B2: semantic content tree + negotiation =====
+
+CONTENT_PROG = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /blog/:slug"
+        let p be {"title": "Hi <there>", "body": "hello & welcome", "tag": "news"}
+        give content(page(
+            [
+                heading(1, title of p),
+                prose(body of p),
+                list(["one", "two"]),
+                link("Back", "/blog"),
+                code("print(1)", "python"),
+                raw("<hr class='x'>")
+            ],
+            {"title": title of p, "description": "An <intro>"}
+        ))
+"""
+
+
+def test_content_default_is_html_with_head():
+    with serving(CONTENT_PROG) as req:
+        status, headers, raw = req.raw("GET", "/blog/hello")
+        assert status == 200
+        assert headers.get("Content-Type") == "text/html; charset=utf-8"
+        body = raw.decode()
+        assert body.startswith("<!DOCTYPE html>")
+        # <head> built from page metadata
+        assert "<title>Hi &lt;there&gt;</title>" in body
+        assert '<meta name="description" content="An &lt;intro&gt;">' in body
+        # JSON-LD structured data from the metadata
+        assert 'application/ld+json' in body
+        # semantic vocabulary rendered
+        assert "<h1>Hi &lt;there&gt;</h1>" in body
+        assert "<ul><li>one</li><li>two</li></ul>" in body
+        assert '<a href="/blog">Back</a>' in body
+        assert 'language-python' in body
+
+
+def test_content_auto_escapes_but_raw_passes_through():
+    with serving(CONTENT_PROG) as req:
+        status, headers, raw = req.raw("GET", "/blog/hello")
+        body = raw.decode()
+        # text content is auto-escaped (no live <there> tag) — XSS-safe by default
+        assert "<there>" not in body
+        assert "&lt;there&gt;" in body
+        assert "hello &amp; welcome" in body
+        # raw() opts out of escaping
+        assert "<hr class='x'>" in body
+
+
+def test_content_markdown_via_accept():
+    with serving(CONTENT_PROG) as req:
+        status, headers, raw = req.raw(
+            "GET", "/blog/hello", headers={"Accept": "text/markdown"})
+        assert status == 200
+        assert headers.get("Content-Type") == "text/markdown; charset=utf-8"
+        body = raw.decode()
+        assert "# Hi <there>" in body          # markdown is not HTML-escaped
+        assert "- one\n- two" in body
+        assert "[Back](/blog)" in body
+        assert "```python\nprint(1)\n```" in body
+
+
+def test_content_markdown_via_suffix():
+    with serving(CONTENT_PROG) as req:
+        status, headers, raw = req.raw("GET", "/blog/hello.md")
+        assert status == 200
+        assert headers.get("Content-Type") == "text/markdown; charset=utf-8"
+        assert "# Hi <there>" in raw.decode()
+
+
+def test_content_json_via_suffix():
+    with serving(CONTENT_PROG) as req:
+        status, headers, raw = req.raw("GET", "/blog/hello.json")
+        assert status == 200
+        assert headers.get("Content-Type") == "application/json; charset=utf-8"
+        tree = json.loads(raw)
+        assert tree["type"] == "page"
+        assert tree["meta"]["title"] == "Hi <there>"
+        kinds = [n["type"] for n in tree["nodes"]]
+        assert kinds == ["heading", "prose", "list", "link", "code", "raw"]
+        assert tree["nodes"][0] == {"type": "heading", "level": 1, "text": "Hi <there>"}
+
+
+def test_content_json_via_accept():
+    with serving(CONTENT_PROG) as req:
+        status, headers, raw = req.raw(
+            "GET", "/blog/hello", headers={"Accept": "application/json"})
+        assert status == 200
+        assert headers.get("Content-Type") == "application/json; charset=utf-8"
+        assert json.loads(raw)["type"] == "page"
+
+
+def test_content_star_accept_defaults_to_html():
+    with serving(CONTENT_PROG) as req:
+        status, headers, raw = req.raw("GET", "/blog/hello", headers={"Accept": "*/*"})
+        assert headers.get("Content-Type") == "text/html; charset=utf-8"
+
+
+def test_real_static_file_wins_over_suffix():
+    # A real x.json file is served as-is; the suffix is NOT a format request here.
+    with _dirs({"public/data.json": '{"real": "file"}'}) as base:
+        prog = f"""
+require serve(__PORT__)
+serve on __PORT__
+    static "{base}/public"
+    route "GET /:slug"
+        give content(page([heading(1, params.slug)], {{"title": params.slug}}))
+"""
+        with serving(prog) as req:
+            status, headers, raw = req.raw("GET", "/data.json")
+            assert status == 200
+            assert json.loads(raw) == {"real": "file"}
+
+
+def test_declared_literal_route_wins_over_negotiation():
+    # A route authored literally as /report.json is served as-is, not negotiated.
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /report.json"
+        give {"literal": true}
+    route "GET /:slug"
+        give content(page([heading(1, params.slug)], {"title": params.slug}))
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/report.json")
+        assert headers.get("Content-Type") == "application/json"
+        assert json.loads(raw) == {"literal": True}
+
+
+def test_non_content_give_is_unaffected_by_accept():
+    # Without content(), Accept does nothing: a map is still JSON.
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /x"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/x", headers={"Accept": "text/markdown"})
+        assert headers.get("Content-Type") == "application/json"
+        assert json.loads(raw) == {"ok": True}
+
+
+def test_bare_node_without_content_degrades_to_json():
+    # give heading(...) without content() serializes to the node's JSON form.
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /n"
+        give heading(2, "Title")
+"""
+    with serving(prog) as req:
+        status, body = req("GET", "/n")
+        assert status == 200
+        assert body == {"type": "heading", "level": 2, "text": "Title"}
+
+
 if __name__ == "__main__":
     test_functions = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     passed = 0

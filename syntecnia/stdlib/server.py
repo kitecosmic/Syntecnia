@@ -123,6 +123,16 @@ _PAGED = "__serve_paged__"
 # bypasses the JSON contract and is written verbatim with a declared content-type.
 _RAW = "__serve_raw__"
 
+# Metadata flag marking a value produced by content(): a semantic content tree
+# that is negotiated (HTML / Markdown / JSON) per the request (see Module B2).
+_CONTENT = "__serve_content__"
+
+# Metadata flag marking a single content node (heading/prose/list/...).
+_NODE = "__content_node__"
+
+# Format suffixes that select a representation of a content() value.
+_FORMAT_SUFFIXES = (("md", "md"), ("json", "json"), ("html", "html"))
+
 
 @dataclass
 class RawResponse:
@@ -168,6 +178,12 @@ def syn_to_json(value: Optional[SynValue]) -> Any:
     if isinstance(value, SynValue) and value.metadata.get(_PAGED):
         rows, _total = value.raw["fetch"](None, 0)
         return [syn_to_json(r) for r in rows]
+    # content()/node values degrade to their structured JSON tree anywhere they
+    # are serialized as JSON (e.g. `give heading(...)` without content()).
+    if isinstance(value, SynValue) and value.metadata.get(_CONTENT):
+        return _node_to_json(value.raw)
+    if isinstance(value, SynValue) and value.metadata.get(_NODE):
+        return _node_to_json(value)
     t = value.type
     if isinstance(t, SynNothing):
         return None
@@ -303,6 +319,234 @@ def _make_raw(body: str, content_type: str, status: int) -> SynValue:
     )
 
 
+# =========================================================
+# Semantic content tree (content() vocabulary) + renderers
+# =========================================================
+
+def _n_text(value: Optional[SynValue]) -> str:
+    """Extract a plain string from a node-builder argument."""
+    if value is None:
+        return ""
+    if isinstance(value.type, SynText):
+        return value.raw
+    return str(value)
+
+
+def _n_nodes(value: Optional[SynValue]) -> list:
+    """Extract a list of child SynValues from a node-builder argument."""
+    if value is not None and isinstance(value.type, SynList):
+        return list(value.raw)
+    return []
+
+
+def _n_meta(value: Optional[SynValue]) -> dict:
+    """Extract a {str: str} metadata dict from a page() argument."""
+    if value is None or not isinstance(value.type, SynMap):
+        return {}
+    out = {}
+    for k, v in value.raw.items():
+        out[str(k)] = v.raw if isinstance(getattr(v, "type", None), SynText) else str(v)
+    return out
+
+
+def _node(kind: str, **fields) -> SynValue:
+    data = {"kind": kind}
+    data.update(fields)
+    return SynValue(raw=data, type=SynMap(), metadata={_NODE: True})
+
+
+def _is_node(value: Any) -> bool:
+    return isinstance(value, SynValue) and value.metadata.get(_NODE) is True
+
+
+# -- JSON rendering (the tree as data) --
+
+def _item_to_json(item: Any) -> Any:
+    if _is_node(item):
+        return _node_to_json(item)
+    return syn_to_json(item) if isinstance(item, SynValue) else item
+
+
+def _node_to_json(node: SynValue) -> Any:
+    d = node.raw
+    kind = d["kind"]
+    if kind == "page":
+        return {
+            "type": "page",
+            "meta": d.get("meta", {}),
+            "nodes": [_node_to_json(n) for n in d.get("nodes", []) if _is_node(n)],
+        }
+    if kind in ("list", "ordered_list"):
+        return {"type": kind, "items": [_item_to_json(i) for i in d.get("items", [])]}
+    if kind == "section":
+        return {"type": "section",
+                "nodes": [_node_to_json(n) for n in d.get("nodes", []) if _is_node(n)]}
+    out = {"type": kind}
+    for key in ("level", "text", "href", "src", "alt", "lang", "html"):
+        if key in d and d[key] is not None:
+            out[key] = d[key]
+    return out
+
+
+# -- HTML rendering (semantic + <head> from metadata) --
+
+def _esc(s: str) -> str:
+    import html as _html
+    return _html.escape(str(s), quote=True)
+
+
+def _render_li(item: Any) -> str:
+    if _is_node(item):
+        return f"<li>{_render_node_html(item)}</li>"
+    return f"<li>{_esc(item.raw if isinstance(item, SynValue) else item)}</li>"
+
+
+def _render_node_html(node: SynValue) -> str:
+    d = node.raw
+    kind = d["kind"]
+    if kind == "heading":
+        lvl = min(6, max(1, int(d.get("level", 1))))
+        return f"<h{lvl}>{_esc(d.get('text', ''))}</h{lvl}>\n"
+    if kind == "prose":
+        return f"<p>{_esc(d.get('text', ''))}</p>\n"
+    if kind in ("list", "ordered_list"):
+        tag = "ol" if kind == "ordered_list" else "ul"
+        inner = "".join(_render_li(i) for i in d.get("items", []))
+        return f"<{tag}>{inner}</{tag}>\n"
+    if kind == "link":
+        return f'<a href="{_esc(d.get("href", ""))}">{_esc(d.get("text", ""))}</a>\n'
+    if kind == "image":
+        return f'<img src="{_esc(d.get("src", ""))}" alt="{_esc(d.get("alt", ""))}">\n'
+    if kind == "section":
+        inner = "".join(_render_node_html(n) for n in d.get("nodes", []) if _is_node(n))
+        return f"<section>\n{inner}</section>\n"
+    if kind == "code":
+        lang = d.get("lang")
+        cls = f' class="language-{_esc(lang)}"' if lang else ""
+        return f"<pre><code{cls}>{_esc(d.get('text', ''))}</code></pre>\n"
+    if kind == "raw":
+        return d.get("html", "")          # escape hatch: NOT escaped
+    if kind == "page":
+        return "".join(_render_node_html(n) for n in d.get("nodes", []) if _is_node(n))
+    return ""
+
+
+def _render_html(tree: SynValue) -> str:
+    d = tree.raw
+    meta = d.get("meta", {}) if d.get("kind") == "page" else {}
+    title = meta.get("title")
+    description = meta.get("description")
+    head = ['<meta charset="utf-8">',
+            '<meta name="viewport" content="width=device-width, initial-scale=1">']
+    if title:
+        head.append(f"<title>{_esc(title)}</title>")
+    if description:
+        head.append(f'<meta name="description" content="{_esc(description)}">')
+    # Structured data (JSON-LD) from the page metadata → SEO for crawlers/agents.
+    if title or description:
+        ld = {"@context": "https://schema.org", "@type": "WebPage"}
+        if title:
+            ld["name"] = title
+        if description:
+            ld["description"] = description
+        # Escape <, >, & as \uXXXX so the JSON can't break out of the <script>
+        # element (e.g. a </script> in the title) — valid JSON, XSS-safe.
+        ld_json = (json.dumps(ld).replace("<", "\\u003c")
+                   .replace(">", "\\u003e").replace("&", "\\u0026"))
+        head.append('<script type="application/ld+json">' + ld_json + "</script>")
+    if d.get("kind") == "page":
+        body = "".join(_render_node_html(n) for n in d.get("nodes", []) if _is_node(n))
+    else:
+        body = _render_node_html(tree)
+    return (
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+        + "\n".join(head)
+        + "\n</head>\n<body>\n"
+        + body
+        + "</body>\n</html>\n"
+    )
+
+
+# -- Markdown rendering (for agents) --
+
+def _md_inline(item: Any) -> str:
+    if _is_node(item):
+        return _render_node_md(item).strip()
+    return str(item.raw if isinstance(item, SynValue) else item)
+
+
+def _render_node_md(node: SynValue) -> str:
+    d = node.raw
+    kind = d["kind"]
+    if kind == "heading":
+        lvl = min(6, max(1, int(d.get("level", 1))))
+        return "#" * lvl + " " + d.get("text", "")
+    if kind == "prose":
+        return d.get("text", "")
+    if kind == "list":
+        return "\n".join("- " + _md_inline(i) for i in d.get("items", []))
+    if kind == "ordered_list":
+        return "\n".join(f"{n}. " + _md_inline(i)
+                         for n, i in enumerate(d.get("items", []), 1))
+    if kind == "link":
+        return f"[{d.get('text', '')}]({d.get('href', '')})"
+    if kind == "image":
+        return f"![{d.get('alt', '')}]({d.get('src', '')})"
+    if kind == "section":
+        return "\n\n".join(_render_node_md(n) for n in d.get("nodes", []) if _is_node(n))
+    if kind == "code":
+        lang = d.get("lang") or ""
+        return f"```{lang}\n{d.get('text', '')}\n```"
+    if kind == "raw":
+        return d.get("html", "")          # raw HTML passes through Markdown
+    if kind == "page":
+        return "\n\n".join(_render_node_md(n) for n in d.get("nodes", []) if _is_node(n))
+    return ""
+
+
+def _render_markdown(tree: SynValue) -> str:
+    d = tree.raw
+    if d.get("kind") == "page":
+        body = "\n\n".join(_render_node_md(n) for n in d.get("nodes", []) if _is_node(n))
+    else:
+        body = _render_node_md(tree)
+    return body.rstrip() + "\n"
+
+
+# -- Negotiation --
+
+def negotiate_format(accept: str) -> str:
+    """Map an Accept header to a content format. Default (incl. */*) is HTML."""
+    a = (accept or "").lower()
+    if "text/markdown" in a and "text/html" not in a:
+        return "md"
+    if "application/json" in a and "text/html" not in a:
+        return "json"
+    return "html"
+
+
+def split_format_suffix(path: str) -> Tuple[str, Optional[str]]:
+    """Strip a trailing .md/.json/.html, returning (logical_path, format|None)."""
+    for ext, fmt in _FORMAT_SUFFIXES:
+        dotted = "." + ext
+        if path.endswith(dotted) and len(path) > len(dotted) and not path[:-len(dotted)].endswith("/"):
+            return path[:-len(dotted)], fmt
+    return path, None
+
+
+def render_content(content_value: SynValue, fmt: str) -> RawResponse:
+    """Render a content() value in the chosen format as a RawResponse."""
+    tree = content_value.raw
+    if fmt == "json":
+        body = json.dumps(_node_to_json(tree))
+        return RawResponse(body=body, content_type="application/json; charset=utf-8")
+    if fmt == "md":
+        return RawResponse(body=_render_markdown(tree),
+                           content_type="text/markdown; charset=utf-8")
+    return RawResponse(body=_render_html(tree),
+                       content_type="text/html; charset=utf-8")
+
+
 def register_serve_builtins(env):
     """Register the response helpers: ok, created, not_found, fail, html, respond."""
 
@@ -370,6 +614,52 @@ def register_serve_builtins(env):
             status = int(args[2].raw)
         return _make_raw(content, content_type, status)
 
+    # -- Semantic content vocabulary (Module B1b) --
+
+    def _page(args: List[SynValue]) -> SynValue:
+        nodes = _n_nodes(args[0]) if args else []
+        meta = _n_meta(args[1]) if len(args) > 1 else {}
+        return _node("page", nodes=nodes, meta=meta)
+
+    def _heading(args: List[SynValue]) -> SynValue:
+        level = int(args[0].raw) if args and isinstance(args[0].type, SynNumber) else 1
+        text = _n_text(args[1]) if len(args) > 1 else ""
+        return _node("heading", level=level, text=text)
+
+    def _prose(args: List[SynValue]) -> SynValue:
+        return _node("prose", text=_n_text(args[0]) if args else "")
+
+    def _list(args: List[SynValue]) -> SynValue:
+        return _node("list", items=_n_nodes(args[0]) if args else [])
+
+    def _ordered_list(args: List[SynValue]) -> SynValue:
+        return _node("ordered_list", items=_n_nodes(args[0]) if args else [])
+
+    def _link(args: List[SynValue]) -> SynValue:
+        text = _n_text(args[0]) if args else ""
+        href = _n_text(args[1]) if len(args) > 1 else ""
+        return _node("link", text=text, href=href)
+
+    def _image(args: List[SynValue]) -> SynValue:
+        src = _n_text(args[0]) if args else ""
+        alt = _n_text(args[1]) if len(args) > 1 else ""
+        return _node("image", src=src, alt=alt)
+
+    def _section(args: List[SynValue]) -> SynValue:
+        return _node("section", nodes=_n_nodes(args[0]) if args else [])
+
+    def _code(args: List[SynValue]) -> SynValue:
+        text = _n_text(args[0]) if args else ""
+        lang = _n_text(args[1]) if len(args) > 1 else None
+        return _node("code", text=text, lang=lang)
+
+    def _raw(args: List[SynValue]) -> SynValue:
+        return _node("raw", html=_n_text(args[0]) if args else "")
+
+    def _content(args: List[SynValue]) -> SynValue:
+        tree = args[0] if args else _node("page", nodes=[], meta={})
+        return SynValue(raw=tree, type=SynMap(), metadata={_CONTENT: True})
+
     builtins = {
         "ok": BuiltinTask("ok", _ok, 1),
         "created": BuiltinTask("created", _created, 1),
@@ -377,6 +667,18 @@ def register_serve_builtins(env):
         "fail": BuiltinTask("fail", _fail, -1),
         "html": BuiltinTask("html", _html, 1),
         "respond": BuiltinTask("respond", _respond, -1),
+        # Content vocabulary + negotiable wrapper
+        "page": BuiltinTask("page", _page, -1),
+        "heading": BuiltinTask("heading", _heading, 2),
+        "prose": BuiltinTask("prose", _prose, 1),
+        "list": BuiltinTask("list", _list, 1),
+        "ordered_list": BuiltinTask("ordered_list", _ordered_list, 1),
+        "link": BuiltinTask("link", _link, 2),
+        "image": BuiltinTask("image", _image, 2),
+        "section": BuiltinTask("section", _section, 1),
+        "code": BuiltinTask("code", _code, -1),
+        "raw": BuiltinTask("raw", _raw, 1),
+        "content": BuiltinTask("content", _content, 1),
     }
     for name, builtin in builtins.items():
         env.set(name, SynValue(raw=builtin, type=SynTask()))
@@ -493,6 +795,13 @@ class ServeRuntime:
             else:
                 ranks.append(0)
         return ranks
+
+    @staticmethod
+    def _param_last_segment(pattern: str) -> bool:
+        """True if the pattern's last segment is a :param (which could swallow a
+        format suffix). A literal segment or a *catch-all keeps the dotted value."""
+        segs = [s for s in pattern.split("/") if s != ""]
+        return bool(segs) and segs[-1].startswith(":")
 
     @staticmethod
     def _path_match(pattern: str, path: str) -> Optional[Dict[str, str]]:
@@ -665,7 +974,25 @@ class ServeRuntime:
         body_str is the in-memory body text (or None when the body was spilled
         to disk, in which case body_file is the temp path).
         """
+        # Match the full path first (declared routes and literal paths win as-is:
+        # `GET /data.json` and a real data.json file both beat negotiation).
         route, params = self._match(method, path)
+
+        # Content negotiation by URL suffix (.md/.json/.html): only when a :param
+        # swallowed the suffix (e.g. /blog/:slug matched /blog/hola.json) do we
+        # re-interpret it as a format. A literal route or *catch-all keeps the
+        # dotted value. A real static file at the exact path still wins.
+        explicit_fmt = None
+        logical_path, sfx = split_format_suffix(path)
+        if sfx is not None and route is not None and self._param_last_segment(route.path):
+            if method == "GET" and self.static_mounts:
+                raw = self.serve_static(path)
+                if raw is not None:
+                    return raw.status, raw, {}, None
+            lroute, lparams = self._match(method, logical_path)
+            if lroute is not None:
+                route, params, explicit_fmt = lroute, lparams, sfx
+
         if route is None:
             allowed = self.methods_for_path(path)
             if allowed:
@@ -759,8 +1086,22 @@ class ServeRuntime:
         except Exception as e:  # never crash the server
             return 500, {"error": f"{type(e).__name__}: {e}", "status": 500}, rate_headers, None
 
+        # A content() value is negotiated: explicit suffix wins, else the Accept
+        # header (default HTML). Anything else follows the normal JSON contract.
+        if isinstance(give_value, SynValue) and give_value.metadata.get(_CONTENT):
+            fmt = explicit_fmt or negotiate_format(self._accept_header(headers))
+            raw = render_content(give_value, fmt)
+            return raw.status, raw, rate_headers, None
+
         status, body = build_response(give_value, query)
         return status, body, rate_headers, None
+
+    @staticmethod
+    def _accept_header(headers: Dict[str, str]) -> str:
+        for k, v in headers.items():
+            if k.lower() == "accept":
+                return v
+        return ""
 
     # -- lifecycle --
 

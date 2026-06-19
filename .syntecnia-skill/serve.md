@@ -208,6 +208,74 @@ serve on 8090
   credentials (`Authorization`/cookies). If you send credentials cross-origin, set
   a **specific** origin (`cors "https://app.example.com"`), not `*`.
 
+## Web for agents — semantic content & negotiation (`content()`)
+
+For content that **both humans and agents** consume (blog posts, docs, a KB), you
+describe the content **once** as a tree of semantic nodes and `give content(tree)`.
+The runtime then negotiates the representation per request — HTML for browsers,
+Markdown for agents, JSON for tools — from the **same route**.
+
+```
+task post_view(p)
+    give page(
+        [
+            heading(1, title of p),
+            prose("Published " + format_time(created of p)),
+            prose(body of p),
+            link("Back", "/blog")
+        ],
+        {"title": title of p, "description": excerpt of p}   -- <head> + SEO
+    )
+
+route "GET /blog/:slug"
+    give content(post_view(load_post(params.slug)))          -- opt-in: negotiated
+```
+
+### Vocabulary (content nodes)
+
+| Builtin | Renders to |
+|---|---|
+| `page(nodes, meta?)` | the document; `meta` (a map) feeds `<title>`/`<meta>` + JSON-LD |
+| `heading(level, text)` | `<h1>`–`<h6>` / `#` |
+| `prose(text)` | `<p>` / paragraph |
+| `list(items)` / `ordered_list(items)` | `<ul>`/`<ol>` / `- ` / `1. ` |
+| `link(text, href)` | `<a>` / `[text](href)` |
+| `image(src, alt)` | `<img>` / `![alt](src)` |
+| `section(nodes)` | `<section>` / grouped blocks |
+| `code(text, lang?)` | `<pre><code>` / fenced ```` ``` ```` |
+| `raw(html)` | the HTML **verbatim** (escape hatch) |
+
+- **Opt-in:** only `give content(tree)` is negotiated. A route that gives
+  `html()`/`respond()` stays HTML, a `{map}`/`list` stays JSON — no magic.
+- **Auto-escape (XSS-safe by default):** all text in the HTML rendering is escaped
+  (`<script>` → `&lt;script&gt;`), including the JSON-LD. Use `raw(html)` to opt
+  out for trusted HTML. You never have to remember to escape.
+- **SEO automatic:** `page` metadata (`title`, `description`) becomes `<title>`,
+  `<meta name="description">` and a JSON-LD `WebPage` block.
+- A content node used **without** `content()` (e.g. `give heading(...)`) degrades
+  to its JSON form.
+
+### Content negotiation (`Accept` + suffix)
+
+The same `content()` route serves three formats. Two triggers, no `?query`:
+
+```
+GET /blog/hola                              # browser → HTML (default)
+GET /blog/hola   Accept: text/markdown      # agent   → Markdown
+GET /blog/hola.md                           # explicit → Markdown
+GET /blog/hola.json                         # explicit → JSON (the node tree)
+```
+
+- **Default is HTML** — including `Accept: */*` or no/unclear `Accept`.
+  `Accept: text/markdown` → Markdown; `Accept: application/json` → JSON.
+- **Suffix** `.md`/`.json`/`.html` is an explicit selector. It is stripped before
+  matching, so it works with `:param` routes (`/blog/hola.json` → slug `hola`).
+- **No conflict with static files / literal routes.** A real file (`data.json`) or
+  a route authored literally (`route "GET /report.json"`) is served **as-is** and
+  wins over negotiation — the suffix only re-interprets a path a `:param` captured.
+  A `*catch-all` keeps the dotted value too (it's not negotiated).
+- Negotiation applies **only** to `content()` values; everything else is unchanged.
+
 ## Pagination
 
 Collections are **never** returned unbounded.
