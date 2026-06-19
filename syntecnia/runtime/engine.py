@@ -398,10 +398,28 @@ class SyntecniaEngine:
         if node.cors is not None:
             cors_origin = str(self.interpreter._exec(node.cors, serve_env).raw)
 
+        # Agent discoverability (/llms.txt): the program intent + describe block.
+        from ..core.types import SynList as _SynList, SynText
+        describe_about = None
+        describe_api = None
+        if node.describe is not None:
+            if node.describe.about is not None:
+                describe_about = str(self.interpreter._exec(node.describe.about, serve_env).raw)
+            if node.describe.api is not None:
+                api_val = self.interpreter._exec(node.describe.api, serve_env)
+                if isinstance(api_val.type, _SynList):
+                    describe_api = [str(x.raw) if isinstance(x.type, SynText) else str(x)
+                                    for x in api_val.raw]
+        intent_text = None
+        if self.intent_enforcer and self.intent_enforcer.intent:
+            intent_text = self.intent_enforcer.intent.description
+
         runtime = ServeRuntime(
             port_num, routes, auth_handler=_auth_runner,
             max_body=max_body, max_streams=max_streams,
             static_mounts=static_mounts, cors_origin=cors_origin,
+            intent=intent_text, describe_about=describe_about,
+            describe_api=describe_api, private=bool(node.private),
         )
         try:
             runtime.start(background=True)

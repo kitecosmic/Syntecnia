@@ -44,6 +44,12 @@ task post_view(p)
     )
 
 serve on 8095
+    -- Agent discoverability: /llms.txt and /robots.txt are auto-served.
+    -- `describe` enriches /llms.txt (try: curl localhost:8095/llms.txt).
+    describe
+        about: "A tiny blog that humans read as HTML and agents read as Markdown"
+        api: ["GET /blog/:slug — a post (HTML / Markdown / JSON)", "GET /blog — list posts"]
+
     -- A content() route: HTML by default, Markdown via Accept/.md, JSON via .json
     route "GET /blog/:slug"
         let p be load_post(params.slug)

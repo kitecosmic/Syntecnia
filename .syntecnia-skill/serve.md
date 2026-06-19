@@ -56,14 +56,14 @@ first.
 ### Soft keywords
 
 `serve`, `on`, `route`, `auth`, `requires`, `expect`, `max_body`, `max_streams`,
-`stream`, `send`, `rate_limit`, `per`, `static`, `from` and `cors` are **soft
-keywords**: they are special *only* at the start of their construction
-(`serve on N`, `route "..."`, `requires auth`, `expect body {...}`,
+`stream`, `send`, `rate_limit`, `per`, `static`, `from`, `cors`, `describe` and
+`private` are **soft keywords**: they are special *only* at the start of their
+construction (`serve on N`, `route "..."`, `requires auth`, `expect body {...}`,
 `max_body "10mb"`, `max_streams N`, a `stream` block, `send` inside one,
 `rate_limit N per window`, `static "./dir"`, `static "/p" from "./dir"`,
-`cors "*"`). Everywhere else they are ordinary names — `let route be "/x"`,
-`let static be 1`, `let from be 3` and `task auth(x)` are valid. The parser
-decides with fixed lookahead, never heuristics.
+`cors "*"`, a `describe` block, `private`). Everywhere else they are ordinary
+names — `let route be "/x"`, `let static be 1`, `let private be 1` and
+`task auth(x)` are valid. The parser decides with fixed lookahead, never heuristics.
 
 ## The request
 
@@ -208,7 +208,7 @@ serve on 8090
   credentials (`Authorization`/cookies). If you send credentials cross-origin, set
   a **specific** origin (`cors "https://app.example.com"`), not `*`.
 
-## Web for agents — semantic content & negotiation (`content()`)
+## Web for agents — SSR, negotiation & discoverability
 
 For content that **both humans and agents** consume (blog posts, docs, a KB), you
 describe the content **once** as a tree of semantic nodes and `give content(tree)`.
@@ -275,6 +275,36 @@ GET /blog/hola.json                         # explicit → JSON (the node tree)
   wins over negotiation — the suffix only re-interprets a path a `:param` captured.
   A `*catch-all` keeps the dotted value too (it's not negotiated).
 - Negotiation applies **only** to `content()` values; everything else is unchanged.
+
+### Discoverability — `/llms.txt`, `/robots.txt`, `describe`, `private`
+
+Every server is **discoverable by agents from day 1, zero config**:
+
+- **`/llms.txt`** (the "robots.txt of the agent era") is auto-generated from the
+  program `intent:`, the route table (method + path), and the `describe` block.
+- **`/robots.txt`** is auto-served (allows crawlers and points them at the site).
+
+Enrich or opt out with two clauses on the serve block:
+
+```
+serve on 8080
+    describe                       -- enriches /llms.txt (optional)
+        about: "Blog and waitlist for Syntecnia"
+        api: ["GET /blog/:slug — an article", "POST /api/signup — join"]
+    -- private                     -- opt-out: internal server, publish nothing
+    route "GET /blog/:slug"
+        give content(post_view(load_post(params.slug)))
+```
+
+- **`describe`** (soft keyword): `about:` becomes the `/llms.txt` title and
+  `api:` a curated endpoint list. The `intent:` becomes the summary.
+- **`private`** (soft keyword): disables `/llms.txt` (returns `404`) and makes
+  `/robots.txt` `Disallow: /` — for internal servers/dashboards, so they don't
+  leak their shape (secure by default).
+- A declared route or a static file at `/llms.txt` or `/robots.txt` **overrides**
+  the auto-generated one.
+- Combined with the `content()` page metadata → JSON-LD, this closes the SEO +
+  agent-discovery loop.
 
 ## Pagination
 

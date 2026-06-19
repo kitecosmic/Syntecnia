@@ -1838,6 +1838,97 @@ serve on __PORT__
         assert body == {"type": "heading", "level": 2, "text": "Title"}
 
 
+# ===== MODULE B3: agent discoverability (/llms.txt, /robots.txt) =====
+
+def test_llms_txt_zero_config():
+    # No config: /llms.txt exists and lists the intent + the route table.
+    prog = """
+intent: "A tiny demo service"
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /blog/:slug"
+        give {"x": 1}
+    route "POST /api/signup"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/llms.txt")
+        assert status == 200
+        assert headers.get("Content-Type", "").startswith("text/plain")
+        body = raw.decode()
+        assert "A tiny demo service" in body          # intent
+        assert "GET /blog/:slug" in body              # route table
+        assert "POST /api/signup" in body
+
+
+def test_robots_txt_present_and_allows():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /x"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/robots.txt")
+        assert status == 200
+        body = raw.decode()
+        assert "User-agent: *" in body
+        assert "Allow: /" in body
+
+
+def test_describe_enriches_llms_txt():
+    prog = """
+intent: "Internal purpose text"
+require serve(__PORT__)
+serve on __PORT__
+    describe
+        about: "Public Blog API"
+        api: ["GET /blog/:slug -- an article", "POST /api/signup -- join"]
+    route "GET /blog/:slug"
+        give {"x": 1}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/llms.txt")
+        assert status == 200
+        body = raw.decode()
+        assert "# Public Blog API" in body            # about → title
+        assert "Internal purpose text" in body        # intent → summary
+        assert "## API" in body
+        assert "GET /blog/:slug -- an article" in body
+
+
+def test_private_disables_llms_txt_and_disallows_robots():
+    # private → no /llms.txt (no info leak) and robots tells crawlers to stay out.
+    prog = """
+intent: "Internal dashboard — do not publish"
+require serve(__PORT__)
+serve on __PORT__
+    private
+    route "GET /admin"
+        give {"secret": true}
+"""
+    with serving(prog) as req:
+        status, body = req("GET", "/llms.txt")
+        assert status == 404
+        status, headers, raw = req.raw("GET", "/robots.txt")
+        assert status == 200
+        assert "Disallow: /" in raw.decode()
+
+
+def test_declared_route_overrides_llms_txt():
+    # A user route at /llms.txt wins over the auto-generated one.
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /llms.txt"
+        give respond("custom", "text/plain")
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/llms.txt")
+        assert status == 200
+        assert raw == b"custom"
+
+
 if __name__ == "__main__":
     test_functions = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     passed = 0

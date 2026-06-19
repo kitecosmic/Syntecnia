@@ -620,6 +620,8 @@ class Parser:
         rate_limit = None
         static_mounts = []
         cors = None
+        describe = None
+        private = False
         routes = []
 
         self._skip_newlines()
@@ -653,13 +655,19 @@ class Parser:
             elif self._check_word("cors"):
                 self._advance()  # consume soft keyword 'cors'
                 cors = self._parse_expression()
+            elif self._check_word("describe"):
+                describe = self._parse_describe()
+            elif self._check_word("private"):
+                self._advance()  # consume soft keyword 'private'
+                private = True
             elif self._check_word("route"):
                 routes.append(self._parse_route())
             else:
                 tok = self._current()
                 raise ParseError(
                     f"Inside 'serve', expected 'auth with ...', 'route ...', "
-                    f"'static ...' or 'cors ...', got {tok.type.name}",
+                    f"'static ...', 'cors ...', 'describe' or 'private', "
+                    f"got {tok.type.name}",
                     tok.location,
                 )
             self._skip_newlines()
@@ -681,8 +689,41 @@ class Parser:
             location=loc, port=port, auth_handler=auth_handler,
             max_body=max_body, max_streams=max_streams,
             rate_limit=rate_limit, static_mounts=static_mounts, cors=cors,
-            routes=routes,
+            describe=describe, private=private, routes=routes,
         )
+
+    def _parse_describe(self) -> ast.DescribeClause:
+        """
+        describe
+            about: "..."
+            api: ["...", "..."]
+        """
+        loc = self._location()
+        self._advance()  # consume soft keyword 'describe'
+        about = None
+        api = None
+        self._skip_newlines()
+        self._expect(TokenType.INDENT, "Expected an indented block after 'describe'")
+        self._skip_newlines()
+        while not self._at_end() and not self._check(TokenType.DEDENT):
+            if self._check_word("about"):
+                self._advance()
+                self._expect(TokenType.COLON, "Expected ':' after 'about'")
+                about = self._parse_expression()
+            elif self._check_word("api"):
+                self._advance()
+                self._expect(TokenType.COLON, "Expected ':' after 'api'")
+                api = self._parse_expression()
+            else:
+                tok = self._current()
+                raise ParseError(
+                    f"Inside 'describe', expected 'about:' or 'api:', got {tok.type.name}",
+                    tok.location,
+                )
+            self._skip_newlines()
+        if self._check(TokenType.DEDENT):
+            self._advance()
+        return ast.DescribeClause(location=loc, about=about, api=api)
 
     def _parse_route(self) -> ast.RouteDefinition:
         """route "METHOD /path/:param" [requires auth]\n    body"""

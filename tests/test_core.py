@@ -400,6 +400,12 @@ def test_soft_keyword_cors_as_variable():
 def test_soft_keyword_from_as_variable():
     assert_output('let from be 3\nprint(from)', ['3'])
 
+def test_soft_keyword_describe_as_variable():
+    assert_output('let describe be 4\nprint(describe)', ['4'])
+
+def test_soft_keyword_private_as_variable():
+    assert_output('let private be 5\nprint(private)', ['5'])
+
 
 # -- Reserved (hard) keywords give a clear error --
 

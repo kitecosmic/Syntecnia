@@ -58,6 +58,8 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 | `/blog/hola.json` runs `:slug` = "hola.json" | The `.md`/`.json`/`.html` suffix is stripped first; slug is "hola" | Expected for `content()` routes; a real `hola.json` file or a literal route wins |
 | `Accept: text/markdown` changes my JSON/`{map}` route | Negotiation applies **only** to `content()` values | Wrap the tree in `content(...)`; plain `give {map}` is always JSON |
 | `give heading(...)` renders an HTML heading | Without `content()` a node degrades to its **JSON** form | Wrap the tree in `content(page([...]))` to get HTML/Markdown |
+| My internal server exposes `/llms.txt` with all its routes | `/llms.txt` + `/robots.txt` are ON by default (agent-discoverable) | Add `private` to the serve block: `/llms.txt` → 404, robots `Disallow: /` |
+| `describe`/`private` can't be used as variable names | They're soft keywords — only special in a serve block | `let private be 1` and `let describe be x` are still valid |
 
 ### Anti-patterns
 

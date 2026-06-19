@@ -738,7 +738,11 @@ class ServeRuntime:
                  host: str = "0.0.0.0", max_body: Optional[int] = MAX_BODY,
                  max_streams: int = DEFAULT_MAX_STREAMS,
                  static_mounts: Optional[List[Tuple[str, str]]] = None,
-                 cors_origin: Optional[str] = None):
+                 cors_origin: Optional[str] = None,
+                 intent: Optional[str] = None,
+                 describe_about: Optional[str] = None,
+                 describe_api: Optional[List[str]] = None,
+                 private: bool = False):
         self.port = int(port)
         self.host = host
         # Routes are matched by specificity, NOT declaration order, so a
@@ -757,6 +761,12 @@ class ServeRuntime:
         self.static_mounts = sorted(mounts, key=lambda m: len(m[0]), reverse=True)
         # CORS origin — declared via `cors "*"` / `cors "https://app.com"`.
         self.cors_origin = cors_origin
+        # Agent discoverability (Module B3): /llms.txt + /robots.txt are served
+        # by default; `describe` enriches /llms.txt and `private` disables it.
+        self.intent = intent
+        self.describe_about = describe_about
+        self.describe_api = describe_api or []
+        self.private = bool(private)
         self.httpd: Optional[ThreadingHTTPServer] = None
         self.thread: Optional[threading.Thread] = None
         self._stream_lock = threading.Lock()
@@ -929,6 +939,44 @@ class ServeRuntime:
                                status=200)
         return None
 
+    # -- agent discoverability (/llms.txt, /robots.txt) --
+
+    def _llms_txt(self) -> str:
+        """
+        Generate /llms.txt from the program intent, the describe block and the
+        route table — the "robots.txt of the agent era". Markdown, per llmstxt.org.
+        """
+        title = self.describe_about or self.intent or "Syntecnia service"
+        lines = [f"# {title}"]
+        if self.intent and self.intent != title:
+            lines += ["", f"> {self.intent}"]
+        endpoints = sorted({(r.method, r.path) for r in self.routes},
+                           key=lambda mp: (mp[1], mp[0]))
+        if endpoints:
+            lines += ["", "## Endpoints"]
+            lines += [f"- {m} {p}" for m, p in endpoints]
+        if self.describe_api:
+            lines += ["", "## API"]
+            lines += [f"- {item}" for item in self.describe_api]
+        return "\n".join(lines) + "\n"
+
+    def _robots_txt(self) -> str:
+        # A private server tells crawlers to stay away; a public one allows them
+        # and points at /llms.txt.
+        if self.private:
+            return "User-agent: *\nDisallow: /\n"
+        return "User-agent: *\nAllow: /\n"
+
+    def discovery_response(self, path: str) -> Optional[RawResponse]:
+        """Serve the auto-generated /llms.txt or /robots.txt, or None."""
+        if path == "/llms.txt" and not self.private:
+            return RawResponse(body=self._llms_txt(),
+                               content_type="text/plain; charset=utf-8")
+        if path == "/robots.txt":
+            return RawResponse(body=self._robots_txt(),
+                               content_type="text/plain; charset=utf-8")
+        return None
+
     def methods_for_path(self, path: str) -> List[str]:
         """Methods of all routes whose path pattern matches (for 405 / Allow / OPTIONS)."""
         methods = []
@@ -1005,11 +1053,15 @@ class ServeRuntime:
                     None,
                 )
             # No declared route at all: a GET/HEAD may be served from a static
-            # mount, if any is configured. (HEAD reaches here as method "GET".)
-            if method == "GET" and self.static_mounts:
-                raw = self.serve_static(path)
-                if raw is not None:
-                    return raw.status, raw, {}, None
+            # mount or by the auto discovery files. (HEAD reaches here as "GET".)
+            if method == "GET":
+                if self.static_mounts:
+                    raw = self.serve_static(path)
+                    if raw is not None:
+                        return raw.status, raw, {}, None
+                disc = self.discovery_response(path)
+                if disc is not None:
+                    return disc.status, disc, {}, None
             return 404, {"error": f"no route for {method} {path}", "status": 404}, {}, None
 
         # Rate limit AFTER matching the route, BEFORE auth/handler — so a
