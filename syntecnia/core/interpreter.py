@@ -175,6 +175,8 @@ class Interpreter:
             "find_all": BuiltinTask("find_all", self._builtin_find_all, 2),
             "capture": BuiltinTask("capture", self._builtin_capture, 2),
             "replace_re": BuiltinTask("replace_re", self._builtin_replace_re, 3),
+            # SSR templates — render("page.html", data) → text/html (auto-escaped)
+            "render": BuiltinTask("render", self._builtin_render, -1),
         }
         for name, builtin in builtins.items():
             self.global_env.set(name, SynValue(raw=builtin, type=SynTask()))
@@ -358,6 +360,22 @@ class Interpreter:
         """replace_re(text, pattern, replacement) → text (\\1 backrefs supported)."""
         rx = self._compile_re(str(args[1].raw))
         return syn_text(rx.sub(str(args[2].raw), str(args[0].raw)))
+
+    def _builtin_render(self, args: List[SynValue]) -> SynValue:
+        """
+        render("page.html", data?) → an HTML response from a template.
+
+        The template's { ... } holes are Syntecnia expressions; values are
+        auto-escaped (raw(...) opts out). Reuses each/when for flow control.
+        """
+        # Lazy imports: server/templates import the interpreter, so importing
+        # them at module load would be circular.
+        from ..stdlib.templates import render_template
+        from ..stdlib.server import _make_raw
+        path = str(args[0].raw) if args else ""
+        data = args[1] if len(args) > 1 else None
+        html_str = render_template(self, path, data)
+        return _make_raw(html_str, "text/html; charset=utf-8", 200)
 
     # =========================================================
     # Main evaluation

@@ -1929,6 +1929,99 @@ serve on __PORT__
         assert raw == b"custom"
 
 
+# ===== MODULE B1a: SSR templates (render()) =====
+
+@contextlib.contextmanager
+def _serving_in_dir(files: dict, program: str):
+    """chdir into a temp dir holding `files`, run the serve program, yield a client."""
+    base = tempfile.mkdtemp(prefix="syn_tmpl_test_")
+    for name, content in files.items():
+        path = os.path.join(base, *name.split("/"))
+        os.makedirs(os.path.dirname(path) or base, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+    old_cwd = os.getcwd()
+    os.chdir(base)
+    port = _free_port()
+    engine = SyntecniaEngine()
+    try:
+        result = engine.run_source(program.replace("__PORT__", str(port)), filename="t.syn")
+        assert result.success, f"program failed to start: {result.errors}"
+        time.sleep(0.25)
+        yield _Client(port)
+    finally:
+        engine.shutdown_servers()
+        engine.db_manager.close_all()
+        os.chdir(old_cwd)
+        shutil.rmtree(base, ignore_errors=True)
+
+
+TEMPLATE = (
+    "<h1>{ title }</h1>\n"
+    "<ul>{ each item in items }<li>{ item }</li>{ end }</ul>\n"
+    "{ when featured }<aside>star</aside>{ otherwise }<aside>none</aside>{ end }\n"
+    "<div>{ raw trusted }</div>\n"
+)
+
+TEMPLATE_PROG = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /"
+        give render("home.html", {"title": "Hi <script>", "items": ["a", "b<x>"], "featured": true, "trusted": "<b>ok</b>"})
+    route "GET /plain"
+        give render("home.html", {"title": "T", "items": [], "featured": false, "trusted": ""})
+    route "GET /missing"
+        give render("nope.html", {})
+"""
+
+
+def test_template_renders_html_and_escapes():
+    with _serving_in_dir({"home.html": TEMPLATE}, TEMPLATE_PROG) as req:
+        status, headers, raw = req.raw("GET", "/")
+        assert status == 200
+        assert headers.get("Content-Type") == "text/html; charset=utf-8"
+        body = raw.decode()
+        # interpolation is auto-escaped (XSS-safe)
+        assert "<h1>Hi &lt;script&gt;</h1>" in body
+        assert "<script>" not in body
+        # each loop, with escaped items
+        assert "<li>a</li><li>b&lt;x&gt;</li>" in body
+        # when (truthy) branch
+        assert "<aside>star</aside>" in body
+        # raw() opts out of escaping
+        assert "<div><b>ok</b></div>" in body
+
+
+def test_template_when_false_and_empty_each():
+    with _serving_in_dir({"home.html": TEMPLATE}, TEMPLATE_PROG) as req:
+        status, headers, raw = req.raw("GET", "/plain")
+        body = raw.decode()
+        assert "<aside>none</aside>" in body     # otherwise branch
+        assert "<ul></ul>" in body               # empty collection
+
+
+def test_template_missing_file_clear_error():
+    with _serving_in_dir({"home.html": TEMPLATE}, TEMPLATE_PROG) as req:
+        status, body = req("GET", "/missing")
+        assert status == 500
+        assert "template not found" in body["error"]
+        assert "nope.html" in body["error"]
+
+
+def test_template_path_traversal_blocked():
+    # render() resolves relative to the cwd and refuses to escape it.
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /x"
+        give render("../outside.html", {})
+"""
+    with _serving_in_dir({"home.html": "ok"}, prog) as req:
+        status, body = req("GET", "/x")
+        assert status == 500
+        assert "escapes the working directory" in body["error"]
+
+
 if __name__ == "__main__":
     test_functions = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     passed = 0

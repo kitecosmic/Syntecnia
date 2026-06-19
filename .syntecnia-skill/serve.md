@@ -210,6 +210,45 @@ serve on 8090
 
 ## Web for agents — SSR, negotiation & discoverability
 
+Two ways to render server-side, for two jobs:
+
+- **`render("page.html", data)`** — templates, for **design pages** (landing,
+  marketing) where you control the exact HTML.
+- **`content(tree)`** — a semantic tree, for **content** humans *and* agents
+  consume (blog/docs), negotiated to HTML / Markdown / JSON.
+
+### Templates — `render()` (pixel-control SSR)
+
+`render("page.html", data)` returns a `text/html` response from a template file.
+The data map's keys become variables inside the template:
+
+```
+route "GET /"
+    give render("home.html", {"title": "Welcome", "items": ["a", "b"], "featured": true})
+```
+
+```html
+<!-- home.html — { ... } holes are Syntecnia expressions, AUTO-ESCAPED -->
+<h1>{ title }</h1>
+<ul>{ each item in items }<li>{ item }</li>{ end }</ul>
+{ when featured }<aside>★</aside>{ otherwise }<aside>—</aside>{ end }
+{ raw trusted_html }              <!-- raw opts out of escaping -->
+```
+
+- **Auto-escape (XSS-safe by default):** every `{ expr }` value is HTML-escaped
+  (`<script>` → `&lt;script&gt;`) — you never have to remember. `{ raw expr }`
+  opts out for trusted HTML.
+- **Flow control reuses Syntecnia:** `{ each VAR in EXPR }…{ end }` and
+  `{ when EXPR }…{ otherwise }…{ end }` — the same `each`/`when` you already know,
+  not a new dialect. Holes may call builtins (`{ format_time(created) }`).
+- **Paths are cwd-relative** and may not escape the working directory (traversal
+  blocked). A missing template or a bad expression is a clear error with
+  `file:line`.
+- **`{`/`}` are delimiters.** Keep CSS/JS (which use braces) in external files
+  served via `static`; for a literal brace use a string hole like `{ "{" }`.
+
+### Semantic content — `content()` (negotiated)
+
 For content that **both humans and agents** consume (blog posts, docs, a KB), you
 describe the content **once** as a tree of semantic nodes and `give content(tree)`.
 The runtime then negotiates the representation per request — HTML for browsers,

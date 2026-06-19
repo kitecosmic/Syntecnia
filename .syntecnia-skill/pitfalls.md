@@ -60,6 +60,9 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 | `give heading(...)` renders an HTML heading | Without `content()` a node degrades to its **JSON** form | Wrap the tree in `content(page([...]))` to get HTML/Markdown |
 | My internal server exposes `/llms.txt` with all its routes | `/llms.txt` + `/robots.txt` are ON by default (agent-discoverable) | Add `private` to the serve block: `/llms.txt` → 404, robots `Disallow: /` |
 | `describe`/`private` can't be used as variable names | They're soft keywords — only special in a serve block | `let private be 1` and `let describe be x` are still valid |
+| CSS `body { }` in a `render()` template breaks | `{`/`}` are template hole delimiters | Put CSS/JS in external files served by `static`; literal brace via `{ "{" }` |
+| User HTML in `{ expr }` renders as a live tag | `render()` auto-escapes every hole (XSS-safe) | Use `{ raw expr }` for trusted HTML on purpose |
+| `render("/etc/passwd", ...)` reads any file | Template paths are cwd-relative; escaping the cwd is blocked | Keep templates under the project; absolute/`..` paths error |
 
 ### Anti-patterns
 

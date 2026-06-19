@@ -86,6 +86,7 @@ Response helpers (set the HTTP status; body follows the response contract):
 - `fail(code, msg)` → `{"error": msg, "status": code}`; also `fail(msg)` → 400, and `fail(code)`
 - `html(content)` → 200, `text/html; charset=utf-8`, raw body (no JSON encoding)
 - `respond(content, content_type, status?)` → raw body with an arbitrary content-type and optional status
+- `render(template_path, data?)` → `text/html` from a template file. `{ expr }` holes are auto-escaped (XSS-safe); `{ raw expr }` opts out; `{ each x in xs }…{ end }` and `{ when c }…{ otherwise }…{ end }` reuse Syntecnia flow. cwd-relative, traversal-blocked; errors carry `file:line`. See serve.md.
 - `read_body()` → full request body text (from memory or the temp file) — inside a route handler
 
 ### Semantic content (negotiated HTML / Markdown / JSON — see serve.md)
