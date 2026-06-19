@@ -23,12 +23,20 @@ like `{ "{" }`.
 
 import html as _html
 import os
+import re
 
 from ..core.types import SynValue, SynText, SynList, SynMap
 
 
 class TemplateError(RuntimeError):
     """A template parse/render error. Carries file:line context where possible."""
+
+
+# A hole that is a single bare name is resolved by direct data lookup (not the
+# expression parser), so a key that happens to be a reserved word (type, show,
+# state, ...) still works — `{ type }` is a field, not a parse error.
+_NAME_RE = re.compile(r"^[A-Za-z_]\w*$")
+_NAME_LITERALS = {"true", "false", "nothing"}
 
 
 # =========================================================
@@ -142,6 +150,18 @@ def _parse_each(content: str, filename: str, line: int):
         raise TemplateError(f"{filename}:{line}: invalid 'each' directive: {e}")
 
 
+def _value_node(expr_src: str, escape: bool, filename: str, line: int):
+    """
+    Build a value node for a hole. A single bare name → a direct data lookup
+    ('name' node, reserved-word-proof); anything else → a parsed expression.
+    """
+    s = expr_src.strip()
+    if _NAME_RE.match(s) and s not in _NAME_LITERALS:
+        return {"t": "name", "name": s, "escape": escape, "line": line}
+    return {"t": "expr", "e": _parse_expr(s, filename, line),
+            "escape": escape, "line": line}
+
+
 def _build_tree(segs, filename: str):
     """Build a nested node tree from flat segments, honouring each/when/end."""
     root = []
@@ -179,11 +199,9 @@ def _build_tree(segs, filename: str):
                     f"{filename}:{line}: '{{ end }}' without a matching block")
             stack.pop()
         elif head == "raw":
-            target.append({"t": "expr", "e": _parse_expr(rest, filename, line),
-                           "escape": False, "line": line})
+            target.append(_value_node(rest, False, filename, line))
         else:
-            target.append({"t": "expr", "e": _parse_expr(content, filename, line),
-                           "escape": True, "line": line})
+            target.append(_value_node(content, True, filename, line))
 
     if len(stack) > 1:
         open_block = stack[-1]
@@ -203,27 +221,54 @@ def _display(value: SynValue) -> str:
     return str(value)
 
 
-def _render_nodes(nodes, interp, env, out):
-    from ..core.interpreter import Environment
+def _emit(value: SynValue, escape: bool, out):
+    s = _display(value)
+    out.append(_html.escape(s, quote=True) if escape else s)
+
+
+def _render_nodes(nodes, interp, env, out, filename):
+    # The interpreter defines its OWN RuntimeError (shadowing the builtin), which
+    # is what env.get raises for an unknown variable — catch that exact type.
+    from ..core.interpreter import Environment, RuntimeError as InterpRuntimeError
     for node in nodes:
         t = node["t"]
         if t == "text":
             out.append(node["s"])
+        elif t == "name":
+            # Direct data lookup — works even if the key is a reserved word.
+            try:
+                val = env.get(node["name"])
+            except (InterpRuntimeError, RuntimeError):
+                raise TemplateError(
+                    f"{filename}:{node['line']}: field '{node['name']}' is not "
+                    f"in the template data")
+            _emit(val, node["escape"], out)
         elif t == "expr":
-            val = interp._exec(node["e"], env)
-            s = _display(val)
-            out.append(s if not node["escape"] else _html.escape(s, quote=True))
+            _emit(interp._exec(node["e"], env), node["escape"], out)
         elif t == "each":
             coll = interp._exec(node["coll"], env)
             items = coll.raw if isinstance(coll.type, SynList) else []
             for item in items:
                 child = Environment(parent=env, name="template:each")
                 child.set(node["var"], item)
-                _render_nodes(node["body"], interp, child, out)
+                _render_nodes(node["body"], interp, child, out, filename)
         elif t == "when":
             cond = interp._exec(node["cond"], env)
             branch = node["then"] if cond.is_truthy() else node["else"]
-            _render_nodes(branch, interp, env, out)
+            _render_nodes(branch, interp, env, out, filename)
+
+
+def validate_template(path: str) -> None:
+    """
+    Resolve + parse a template without rendering it. Raises TemplateError on a
+    missing file or a syntax problem (unclosed hole, missing { end }, bad
+    expression). Used for fail-fast validation at server startup.
+    """
+    target = resolve_template_path(path)
+    filename = os.path.basename(target)
+    with open(target, "r", encoding="utf-8") as f:
+        src = f.read()
+    _build_tree(_segments(src, filename), filename)
 
 
 def render_template(interp, path: str, data) -> str:
@@ -239,5 +284,5 @@ def render_template(interp, path: str, data) -> str:
         for k, v in data.raw.items():
             env.set(str(k), v)
     out = []
-    _render_nodes(tree, interp, env, out)
+    _render_nodes(tree, interp, env, out, filename)
     return "".join(out)

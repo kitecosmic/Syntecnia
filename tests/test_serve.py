@@ -1932,8 +1932,8 @@ serve on __PORT__
 # ===== MODULE B1a: SSR templates (render()) =====
 
 @contextlib.contextmanager
-def _serving_in_dir(files: dict, program: str):
-    """chdir into a temp dir holding `files`, run the serve program, yield a client."""
+def _in_dir(files: dict):
+    """chdir into a temp dir holding `files`; yield (base, free_port). Restores cwd."""
     base = tempfile.mkdtemp(prefix="syn_tmpl_test_")
     for name, content in files.items():
         path = os.path.join(base, *name.split("/"))
@@ -1942,18 +1942,29 @@ def _serving_in_dir(files: dict, program: str):
             f.write(content)
     old_cwd = os.getcwd()
     os.chdir(base)
-    port = _free_port()
-    engine = SyntecniaEngine()
     try:
-        result = engine.run_source(program.replace("__PORT__", str(port)), filename="t.syn")
-        assert result.success, f"program failed to start: {result.errors}"
-        time.sleep(0.25)
-        yield _Client(port)
+        yield base, _free_port()
     finally:
-        engine.shutdown_servers()
-        engine.db_manager.close_all()
         os.chdir(old_cwd)
         shutil.rmtree(base, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def _serving_in_dir(files: dict, program: str, secure: bool = False):
+    """chdir into a temp dir holding `files`, run the serve program, yield a client."""
+    with _in_dir(files) as (base, port):
+        engine = SyntecniaEngine(secure=secure)
+        if secure:
+            from syntecnia.capabilities.model import Capability, CapabilityType
+            engine.capabilities.grant(Capability(CapabilityType.SERVE, str(port)))
+        try:
+            result = engine.run_source(program.replace("__PORT__", str(port)), filename="t.syn")
+            assert result.success, f"program failed to start: {result.errors}"
+            time.sleep(0.25)
+            yield _Client(port)
+        finally:
+            engine.shutdown_servers()
+            engine.db_manager.close_all()
 
 
 TEMPLATE = (
@@ -1970,8 +1981,6 @@ serve on __PORT__
         give render("home.html", {"title": "Hi <script>", "items": ["a", "b<x>"], "featured": true, "trusted": "<b>ok</b>"})
     route "GET /plain"
         give render("home.html", {"title": "T", "items": [], "featured": false, "trusted": ""})
-    route "GET /missing"
-        give render("nope.html", {})
 """
 
 
@@ -2000,26 +2009,117 @@ def test_template_when_false_and_empty_each():
         assert "<ul></ul>" in body               # empty collection
 
 
-def test_template_missing_file_clear_error():
-    with _serving_in_dir({"home.html": TEMPLATE}, TEMPLATE_PROG) as req:
-        status, body = req("GET", "/missing")
-        assert status == 500
-        assert "template not found" in body["error"]
-        assert "nope.html" in body["error"]
+# -- Fix 1: a single-name hole is a direct data lookup (reserved-word-proof) --
 
-
-def test_template_path_traversal_blocked():
-    # render() resolves relative to the cwd and refuses to escape it.
+def test_template_reserved_word_keys_resolve_from_data():
+    # `type` and `show` are reserved words; as a bare hole they must still
+    # resolve from the data (no parse error). A real expression still parses.
+    tpl = "<p>{ type }</p><p>{ show }</p><p>{ upper(name) }</p>"
     prog = """
 require serve(__PORT__)
 serve on __PORT__
-    route "GET /x"
-        give render("../outside.html", {})
+    route "GET /"
+        give render("t.html", {"type": "book", "show": "yes", "name": "hi"})
 """
-    with _serving_in_dir({"home.html": "ok"}, prog) as req:
-        status, body = req("GET", "/x")
+    with _serving_in_dir({"t.html": tpl}, prog) as req:
+        status, headers, raw = req.raw("GET", "/")
+        assert status == 200
+        body = raw.decode()
+        assert "<p>book</p>" in body
+        assert "<p>yes</p>" in body
+        assert "<p>HI</p>" in body              # expression still works
+
+
+def test_template_missing_field_clear_runtime_error():
+    # A bare name not present in the data → clear runtime error naming the field.
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /"
+        give render("t.html", {"present": 1})
+"""
+    with _serving_in_dir({"t.html": "<p>{ ghost }</p>"}, prog) as req:
+        status, body = req("GET", "/")
         assert status == 500
-        assert "escapes the working directory" in body["error"]
+        assert "field 'ghost'" in body["error"]
+        assert "template data" in body["error"]
+
+
+# -- Fix 2a: literal render() templates are validated at startup (fail-fast) --
+
+def test_template_missing_literal_fails_at_startup():
+    prog_t = (
+        'require serve({port})\n'
+        'serve on {port}\n'
+        '    route "GET /"\n'
+        '        give render("nope.html", {{}})'
+    )
+    with _in_dir({"home.html": "ok"}) as (base, port):
+        engine = SyntecniaEngine()
+        result = engine.run_source(prog_t.format(port=port), filename="t.syn")
+        assert not result.success
+        assert len(engine.servers) == 0
+        assert any("template not found" in e and "nope.html" in e for e in result.errors)
+        engine.shutdown_servers()
+
+
+def test_template_syntax_error_fails_at_startup():
+    bad = "<ul>{ each x in xs }<li>{ x }</li>"   # missing { end }
+    prog_t = (
+        'require serve({port})\n'
+        'serve on {port}\n'
+        '    route "GET /"\n'
+        '        give render("bad.html", {{"xs": []}})'
+    )
+    with _in_dir({"bad.html": bad}) as (base, port):
+        engine = SyntecniaEngine()
+        result = engine.run_source(prog_t.format(port=port), filename="t.syn")
+        assert not result.success
+        assert any("end" in e.lower() for e in result.errors)
+        engine.shutdown_servers()
+
+
+def test_template_literal_traversal_fails_at_startup():
+    prog_t = (
+        'require serve({port})\n'
+        'serve on {port}\n'
+        '    route "GET /"\n'
+        '        give render("../outside.html", {{}})'
+    )
+    with _in_dir({"home.html": "ok"}) as (base, port):
+        engine = SyntecniaEngine()
+        result = engine.run_source(prog_t.format(port=port), filename="t.syn")
+        assert not result.success
+        assert any("escapes the working directory" in e for e in result.errors)
+        engine.shutdown_servers()
+
+
+# -- Fix 2b: 500 detail in dev, generic in secure mode (always logged) --
+
+ERR_PROG = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /boom"
+        let x be 1 / 0
+        give {"never": true}
+"""
+
+
+def test_500_includes_detail_in_dev_mode():
+    with _serving_in_dir({}, ERR_PROG) as req:
+        status, body = req("GET", "/boom")
+        assert status == 500
+        # dev (default): the detail is returned so a human/agent can self-correct
+        assert body["error"] != "internal server error"
+        assert body["status"] == 500
+
+
+def test_500_is_generic_in_secure_mode():
+    with _serving_in_dir({}, ERR_PROG, secure=True) as req:
+        status, body = req("GET", "/boom")
+        assert status == 500
+        # secure (production): no internals leak to the client
+        assert body == {"error": "internal server error", "status": 500}
 
 
 if __name__ == "__main__":

@@ -742,9 +742,13 @@ class ServeRuntime:
                  intent: Optional[str] = None,
                  describe_about: Optional[str] = None,
                  describe_api: Optional[List[str]] = None,
-                 private: bool = False):
+                 private: bool = False,
+                 secure: bool = False):
         self.port = int(port)
         self.host = host
+        # In secure mode (production), uncaught 500s return a generic body so
+        # internals don't leak; the full detail always goes to the server log.
+        self.secure = bool(secure)
         # Routes are matched by specificity, NOT declaration order, so a
         # catch-all or :param can never swallow a more specific route. Sorting
         # once here means _match can just return the first matching route.
@@ -1134,9 +1138,9 @@ class ServeRuntime:
         except GiveSignal as g:  # defensive: a give that escaped the handler
             give_value = g.value
         except CapabilityViolation as e:
-            return 500, {"error": str(e), "status": 500}, rate_headers, None
+            return 500, self.server_error(e), rate_headers, None
         except Exception as e:  # never crash the server
-            return 500, {"error": f"{type(e).__name__}: {e}", "status": 500}, rate_headers, None
+            return 500, self.server_error(e), rate_headers, None
 
         # A content() value is negotiated: explicit suffix wins, else the Accept
         # header (default HTML). Anything else follows the normal JSON contract.
@@ -1154,6 +1158,21 @@ class ServeRuntime:
             if k.lower() == "accept":
                 return v
         return ""
+
+    def server_error(self, exc: BaseException) -> Dict[str, Any]:
+        """
+        Body for an uncaught 500. The full detail is ALWAYS logged to the server
+        console (observability). In secure mode the client gets a generic body
+        (no info leak); in dev the detail is returned so a human or agent can
+        self-correct.
+        """
+        import sys
+        detail = f"{type(exc).__name__}: {exc}"
+        sys.stderr.write(f"[serve:{self.port}] 500 {detail}\n")
+        sys.stderr.flush()
+        if self.secure:
+            return {"error": "internal server error", "status": 500}
+        return {"error": detail, "status": 500}
 
     # -- lifecycle --
 
@@ -1382,7 +1401,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 method, path, query, headers, body_str, body_file, client_ip,
             )
         except Exception as e:  # plumbing failure → 500, still no crash
-            status, body_obj, extra, stream = 500, {"error": f"{type(e).__name__}: {e}", "status": 500}, {}, None
+            status, body_obj, extra, stream = 500, runtime.server_error(e), {}, None
         finally:
             if body_file:
                 _safe_unlink(body_file)

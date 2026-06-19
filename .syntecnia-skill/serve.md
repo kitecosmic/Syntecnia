@@ -122,6 +122,20 @@ body larger than 1 MB  → 413  {"error": "payload too large", "status": 413}
 body. A malformed body is only an error when `Content-Type` says JSON; otherwise
 `json of request` is `nothing` and `body of request` keeps the raw text.
 
+### Error responses (dev vs `--secure`)
+
+An uncaught error in a handler becomes a `500`. Its full detail is **always
+logged** to the server console (observability). What the **client** sees depends
+on the mode:
+
+- **Dev (default):** the body includes the detail —
+  `{"error": "<type>: <message>", "status": 500}` — so a human or agent can
+  self-correct. (`expect`/`400` and other client errors always keep their detail.)
+- **Production (`--secure`):** the body is generic —
+  `{"error": "internal server error", "status": 500}` — no internals leak.
+
+This applies to **all** uncaught 500s, not just templates.
+
 ## Serving web pages (HTML, static files, CORS)
 
 `serve` is not only a JSON API — it can serve a real web app: HTML responses,
@@ -235,15 +249,25 @@ route "GET /"
 { raw trusted_html }              <!-- raw opts out of escaping -->
 ```
 
+- **A hole `{ x }` shows the value of `x`.** `x` can be a **data field** (any
+  name — even a reserved word like `type`, `show`, `state`) or an **expression**
+  like `{ format_time(created) }` or `{ a + b }`. A single bare name is looked up
+  directly in the data, so simple field names always work; if the field isn't in
+  the data you get a clear `field 'x' is not in the template data` error.
 - **Auto-escape (XSS-safe by default):** every `{ expr }` value is HTML-escaped
   (`<script>` → `&lt;script&gt;`) — you never have to remember. `{ raw expr }`
   opts out for trusted HTML.
 - **Flow control reuses Syntecnia:** `{ each VAR in EXPR }…{ end }` and
   `{ when EXPR }…{ otherwise }…{ end }` — the same `each`/`when` you already know,
-  not a new dialect. Holes may call builtins (`{ format_time(created) }`).
+  not a new dialect.
 - **Paths are cwd-relative** and may not escape the working directory (traversal
-  blocked). A missing template or a bad expression is a clear error with
-  `file:line`.
+  blocked).
+- **Errors are caught early.** A template referenced as `render("literal.html")`
+  is validated **at startup** (file exists + parses), so a typo/missing file
+  fails when the program runs — not on the first request. A runtime error (e.g. a
+  missing field) is a `500`: in dev the detail (with `file:line`) is returned so
+  you or an agent can fix it; with `--secure` the body is generic and the detail
+  only goes to the server log (see "Error responses" below).
 - **`{`/`}` are delimiters.** Keep CSS/JS (which use braces) in external files
   served via `static`; for a literal brace use a string hole like `{ "{" }`.
 
