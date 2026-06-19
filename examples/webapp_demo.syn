@@ -37,7 +37,8 @@ serve on 8090
     route "POST /api/signup"
         expect body {email: text}
         let email be email of (json of request)
-        when not matches(email, "^[^@ ]+@[^@ ]+\.[^@ ]+$")
+        -- matches is full-match, so an unanchored pattern is already safe.
+        when not matches(email, "[^@ ]+@[^@ ]+\.[^@ ]+")
             give fail(422, "that doesn't look like an email")
         sql_exec("INSERT INTO signups (email, joined) VALUES (?, ?)", [email, now()])
         give created({"joined": true, "email": email})

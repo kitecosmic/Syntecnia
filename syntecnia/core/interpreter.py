@@ -323,9 +323,14 @@ class Interpreter:
             raise RuntimeError(f"invalid regex pattern {pattern!r}: {e}")
 
     def _builtin_matches(self, args: List[SynValue]) -> SynValue:
-        """matches(text, pattern) → bool — true if the pattern is found anywhere."""
+        """
+        matches(text, pattern) → bool — true only if the WHOLE text matches the
+        pattern. Built for input validation, so an unanchored pattern is already
+        safe (no need to remember ^...$). For "does the pattern appear somewhere",
+        use find_all / capture.
+        """
         rx = self._compile_re(str(args[1].raw))
-        return syn_bool(rx.search(str(args[0].raw)) is not None)
+        return syn_bool(rx.fullmatch(str(args[0].raw)) is not None)
 
     def _builtin_find_all(self, args: List[SynValue]) -> SynValue:
         """find_all(text, pattern) → list of every (whole) match, in order."""

@@ -347,6 +347,21 @@ route "POST /users"
 field or a type mismatch → **400** with the offending `field` named. Types:
 `text`, `number`, `bool`, `list`, `map`.
 
+For finer checks than a type (email, phone, slug…), use `matches(value, pattern)`
+— it is a **full match** (the whole value must match), so an unanchored pattern is
+already safe for validation; no `^...$` needed:
+
+```
+route "POST /signup"
+    expect body {email: text}
+    let email be email of (json of request)
+    when not matches(email, "[^@ ]+@[^@ ]+\.[^@ ]+")
+        give fail(422, "that doesn't look like an email")
+    ...
+```
+
+(For "does the pattern appear somewhere" use `find_all`/`capture` — see builtins.md.)
+
 ## Request body limits
 
 The request body is bounded so a single oversized request can't exhaust memory.

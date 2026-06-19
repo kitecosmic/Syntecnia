@@ -25,9 +25,9 @@
 - `replace_text(text, old, new)` → text with literal replacements
 
 ## Regex (pure — no capability)
-- `matches(text, pattern)` → bool (true if the pattern is found anywhere; uses search, not full-match)
-- `find_all(text, pattern)` → list of every whole match, in order: `find_all("a1b2", "[0-9]")` → `["1","2"]`
-- `capture(text, pattern)` → first match: with groups, a list of group values; without groups, the whole match as text; no match → `nothing`
+- `matches(text, pattern)` → bool — **full match**: true only if the *whole* text matches. Built for validation, so an unanchored pattern is already safe (`matches("12345", "[0-9]+")` → true, `matches("a 5 b", "[0-9]+")` → false). For "does the pattern appear somewhere", use `find_all`/`capture`.
+- `find_all(text, pattern)` → list of every whole match, in order (partial search): `find_all("a1b2", "[0-9]")` → `["1","2"]`
+- `capture(text, pattern)` → first match (partial search): with groups, a list of group values; without groups, the whole match as text; no match → `nothing`
 - `replace_re(text, pattern, replacement)` → text (`\1`/`\2` backreferences supported)
 - ⚠️ A pathological pattern can be slow (ReDoS) — don't feed untrusted input as a *pattern* without care.
 

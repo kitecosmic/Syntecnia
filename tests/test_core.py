@@ -308,10 +308,16 @@ def test_builtin_type_of():
 # -- Regex builtins (pure, no capability) --
 
 def test_regex_matches():
+    # Full-match semantics: the WHOLE text must match the pattern.
+    assert_output('print(text(matches("12345", "[0-9]+")))', ['true'])
+    assert_output('print(text(matches("hello 5 world", "[0-9]+")))', ['false'])
+    # An UNANCHORED email pattern is already safe — no ^...$ needed.
+    assert_output(r'print(text(matches("a@b.com", "[^@ ]+@[^@ ]+\.[^@ ]+")))', ['true'])
+    assert_output(r'print(text(matches("junk a@b.com junk", "[^@ ]+@[^@ ]+\.[^@ ]+")))',
+                  ['false'])
+    # Explicit anchors are now redundant but must not break anything.
     assert_output(r'print(text(matches("a@b.com", "^[^@]+@[^@]+\.[^@]+$")))', ['true'])
     assert_output(r'print(text(matches("not-an-email", "^[^@]+@[^@]+\.[^@]+$")))', ['false'])
-    # search semantics: a substring match counts as a match.
-    assert_output('print(text(matches("xx 42 yy", "[0-9]+")))', ['true'])
 
 
 def test_regex_find_all():
