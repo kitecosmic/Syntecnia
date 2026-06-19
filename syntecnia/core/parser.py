@@ -618,6 +618,8 @@ class Parser:
         max_body = None
         max_streams = None
         rate_limit = None
+        static_dir = None
+        cors = None
         routes = []
 
         self._skip_newlines()
@@ -637,13 +639,19 @@ class Parser:
                 max_streams = self._parse_expression()
             elif self._check_word("rate_limit"):
                 rate_limit = self._parse_rate_limit()
+            elif self._check_word("static"):
+                self._advance()  # consume soft keyword 'static'
+                static_dir = self._parse_expression()
+            elif self._check_word("cors"):
+                self._advance()  # consume soft keyword 'cors'
+                cors = self._parse_expression()
             elif self._check_word("route"):
                 routes.append(self._parse_route())
             else:
                 tok = self._current()
                 raise ParseError(
-                    f"Inside 'serve', expected 'auth with ...' or 'route ...', "
-                    f"got {tok.type.name}",
+                    f"Inside 'serve', expected 'auth with ...', 'route ...', "
+                    f"'static ...' or 'cors ...', got {tok.type.name}",
                     tok.location,
                 )
             self._skip_newlines()
@@ -664,7 +672,8 @@ class Parser:
         return ast.ServeBlock(
             location=loc, port=port, auth_handler=auth_handler,
             max_body=max_body, max_streams=max_streams,
-            rate_limit=rate_limit, routes=routes,
+            rate_limit=rate_limit, static_dir=static_dir, cors=cors,
+            routes=routes,
         )
 
     def _parse_route(self) -> ast.RouteDefinition:

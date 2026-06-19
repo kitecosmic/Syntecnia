@@ -22,7 +22,14 @@
 - `trim(text)` → strip whitespace
 - `starts_with(text, prefix)` → bool
 - `ends_with(text, suffix)` → bool
-- `replace_text(text, old, new)` → text with replacements
+- `replace_text(text, old, new)` → text with literal replacements
+
+## Regex (pure — no capability)
+- `matches(text, pattern)` → bool (true if the pattern is found anywhere; uses search, not full-match)
+- `find_all(text, pattern)` → list of every whole match, in order: `find_all("a1b2", "[0-9]")` → `["1","2"]`
+- `capture(text, pattern)` → first match: with groups, a list of group values; without groups, the whole match as text; no match → `nothing`
+- `replace_re(text, pattern, replacement)` → text (`\1`/`\2` backreferences supported)
+- ⚠️ A pathological pattern can be slow (ReDoS) — don't feed untrusted input as a *pattern* without care.
 
 ## Intentional operations (replace loops)
 - `apply(function, list)` → list with function applied to each
@@ -49,6 +56,9 @@
 - `get_env(name)` → text or nothing
 - `now()` → unix timestamp (number) — requires `time`
 - `sleep(seconds)` → pause execution (e.g. to pace an SSE stream) — requires `time`
+- `format_time(timestamp, pattern?)` → text — requires `time`. Default ISO-8601 UTC (`format_time(0)` → `"1970-01-01T00:00:00Z"`); with a strftime pattern: `format_time(t, "%Y-%m-%d %H:%M")`
+- `parse_time(text, pattern?)` → timestamp — requires `time`. Inverse of `format_time` (ISO-8601 by default; a trailing `Z` is accepted; times are UTC)
+- `date_parts(timestamp)` → `{year, month, day, hour, minute, second}` (UTC) — requires `time`
 - `random()` → float 0-1
 - `random_int(min, max)` → integer
 
@@ -74,6 +84,8 @@ Response helpers (set the HTTP status; body follows the response contract):
 - `created(x)` → 201
 - `not_found(x)` → 404 — `not_found(text)` → `{"error": text, "status": 404}`; `not_found(map)` → the map as-is
 - `fail(code, msg)` → `{"error": msg, "status": code}`; also `fail(msg)` → 400, and `fail(code)`
+- `html(content)` → 200, `text/html; charset=utf-8`, raw body (no JSON encoding)
+- `respond(content, content_type, status?)` → raw body with an arbitrary content-type and optional status
 - `read_body()` → full request body text (from memory or the temp file) — inside a route handler
 
 ## Cron (Scheduled Tasks)

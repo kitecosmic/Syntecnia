@@ -39,12 +39,13 @@ serve on 8080
 ### Soft keywords
 
 `serve`, `on`, `route`, `auth`, `requires`, `expect`, `max_body`, `max_streams`,
-`stream`, `send`, `rate_limit` and `per` are **soft keywords**: they are special
-*only* at the start of their construction (`serve on N`, `route "..."`,
-`requires auth`, `expect body {...}`, `max_body "10mb"`, `max_streams N`, a
-`stream` block, `send` inside one, `rate_limit N per window`). Everywhere else
-they are ordinary names — `let route be "/x"` and `task auth(x)` are valid. The
-parser decides with fixed lookahead, never heuristics.
+`stream`, `send`, `rate_limit`, `per`, `static` and `cors` are **soft keywords**:
+they are special *only* at the start of their construction (`serve on N`,
+`route "..."`, `requires auth`, `expect body {...}`, `max_body "10mb"`,
+`max_streams N`, a `stream` block, `send` inside one, `rate_limit N per window`,
+`static "./dir"`, `cors "*"`). Everywhere else they are ordinary names —
+`let route be "/x"`, `let static be 1` and `task auth(x)` are valid. The parser
+decides with fixed lookahead, never heuristics.
 
 ## The request
 
@@ -102,6 +103,85 @@ body larger than 1 MB  → 413  {"error": "payload too large", "status": 413}
 `OPTIONS` returns `204` with an `Allow` header; `HEAD` behaves like `GET` with no
 body. A malformed body is only an error when `Content-Type` says JSON; otherwise
 `json of request` is `nothing` and `body of request` keeps the raw text.
+
+## Serving web pages (HTML, static files, CORS)
+
+`serve` is not only a JSON API — it can serve a real web app: HTML responses,
+static assets (CSS/JS/images), and the CORS headers a browser needs.
+
+### HTML and other content-types — `html()`, `respond()`
+
+`give <value>` always produces JSON (`give "<h1>Hi</h1>"` returns the JSON string
+`"<h1>Hi</h1>"`, **not** a page). To return non-JSON, use these helpers:
+
+```
+route "GET /"
+    give html("<h1>Hello</h1>")           -- 200, text/html; charset=utf-8, raw body
+
+route "GET /report.csv"
+    give respond("a,b,c\n1,2,3", "text/csv")   -- any content-type
+
+route "GET /legacy"
+    give respond("<x/>", "application/xml", 404)   -- content-type + status
+```
+
+- `html(content)` → status `200`, `Content-Type: text/html; charset=utf-8`, body
+  written **verbatim** (no `json.dumps`, no quotes).
+- `respond(content, content_type, status?)` → arbitrary content-type, optional
+  status (default `200`).
+- `give <map>` / `give <list>` are unchanged — still JSON. For text plain use
+  `respond(x, "text/plain")` (the `text(...)` builtin is value conversion, not a
+  response helper).
+
+### Static files — `static "./dir"`
+
+Declare a directory and any GET/HEAD that doesn't match a declared route is served
+from it:
+
+```
+serve on 8090
+    static "./public"            -- serve files from ./public; "/" → index.html
+    route "POST /api/signup"     -- declared routes ALWAYS win over static
+        ...
+```
+
+- A `GET`/`HEAD` with no matching route falls through to the static handler:
+  `./public/<path>` is served with a content-type guessed from its extension
+  (`.html`, `.css`, `.js`, `.png`, `.svg`, `.json`, …); `/` serves `index.html`;
+  a missing file → `404` JSON.
+- **Declared routes always win.** If a path is declared (for any method) it is
+  never shadowed by a file — a different method on it gets `405`, not a file.
+- **Only `GET`/`HEAD`.** A `POST` to a static path is not served (→ `404`/`405`).
+- **The declaration is the permission.** `static "./public"` grants reading from
+  that directory; you do **not** also need a `file()` capability for it. The path
+  is relative to the program's working directory.
+- **Path traversal is blocked.** `../`, encoded `..%2f`, absolute paths and
+  symlinks escaping the directory are rejected — the resolved real path must stay
+  inside the static root.
+
+> **Same-origin tip:** if the landing page is served by `static` from the same
+> server as the API, the browser's `fetch` is **same-origin** and needs no CORS.
+
+### CORS — `cors "*"` / `cors "https://app.com"`
+
+For APIs called from a browser on a **different** origin, declare CORS:
+
+```
+serve on 8090
+    cors "*"                     -- or cors "https://app.example.com"
+    route "GET /api/data"
+        give [...]
+```
+
+- With `cors` declared, every response carries `Access-Control-Allow-Origin:
+  <origin>`. A preflight `OPTIONS` additionally returns
+  `Access-Control-Allow-Methods` (the path's methods),
+  `Access-Control-Allow-Headers: Content-Type, Authorization` and
+  `Access-Control-Max-Age`.
+- Without `cors`, no CORS headers are sent (unchanged behavior).
+- **Credentials caveat:** the CORS spec forbids `*` for requests with
+  credentials (`Authorization`/cookies). If you send credentials cross-origin, set
+  a **specific** origin (`cors "https://app.example.com"`), not `*`.
 
 ## Pagination
 

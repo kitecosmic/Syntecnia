@@ -469,6 +469,8 @@ class ServeBlock(Node):
     max_body: Optional[Node] = None      # expression: max request body ("10mb"/bytes/"unlimited")
     max_streams: Optional[Node] = None   # expression: max concurrent SSE streams
     rate_limit: Optional['RateLimitClause'] = None  # default rate limit for all routes
+    static_dir: Optional[Node] = None    # expression: directory to serve static files from
+    cors: Optional[Node] = None          # expression: CORS origin ("*" or "https://app.com")
     routes: List[RouteDefinition] = field(default_factory=list)
 
 @dataclass

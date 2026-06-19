@@ -374,9 +374,18 @@ class SyntecniaEngine:
                 rate_limit=eff_rate, rate_zone=zone,
             ))
 
+        # Resolve the static-file root and CORS origin once (if declared).
+        static_dir = None
+        if node.static_dir is not None:
+            static_dir = str(self.interpreter._exec(node.static_dir, serve_env).raw)
+        cors_origin = None
+        if node.cors is not None:
+            cors_origin = str(self.interpreter._exec(node.cors, serve_env).raw)
+
         runtime = ServeRuntime(
             port_num, routes, auth_handler=_auth_runner,
             max_body=max_body, max_streams=max_streams,
+            static_dir=static_dir, cors_origin=cors_origin,
         )
         try:
             runtime.start(background=True)

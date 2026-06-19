@@ -93,6 +93,24 @@ _ENVELOPE = "__serve_envelope__"
 # Metadata flag marking a value produced by paged() (lazy SQL pagination).
 _PAGED = "__serve_paged__"
 
+# Metadata flag marking a value produced by html()/respond(): a raw body that
+# bypasses the JSON contract and is written verbatim with a declared content-type.
+_RAW = "__serve_raw__"
+
+
+@dataclass
+class RawResponse:
+    """
+    A response body written verbatim — no JSON encoding, an explicit
+    Content-Type. Produced by html()/respond() and by static file serving.
+
+    `body` is bytes (served as-is) or str (encoded UTF-8). `content_type` is the
+    full header value (e.g. "text/html; charset=utf-8").
+    """
+    body: Any            # str or bytes
+    content_type: str
+    status: int = 200
+
 
 # =========================================================
 # SynValue ↔ JSON
@@ -209,9 +227,19 @@ def _shape(value: Optional[SynValue], query: Dict[str, str]) -> Any:
 def build_response(give_value: Optional[SynValue],
                    query: Dict[str, str]) -> Tuple[int, Any]:
     """
-    Turn a handler's give-value into (http_status, json_body) per the contract.
+    Turn a handler's give-value into (http_status, body) per the contract.
+
+    The body is JSON-shaped (a Python value) unless the handler gave an
+    html()/respond() value, in which case it is a RawResponse written verbatim.
     Helper envelopes (ok/created/not_found/fail) carry an explicit status.
     """
+    # Raw (html/respond) bypasses the JSON contract entirely.
+    if isinstance(give_value, SynValue) and give_value.metadata.get(_RAW):
+        r = give_value.raw
+        status = int(r["status"].raw)
+        body = r["body"].raw
+        return status, RawResponse(body=body, content_type=str(r["content_type"].raw),
+                                   status=status)
     status = 200
     value = give_value
     if isinstance(give_value, SynValue) and give_value.metadata.get(_ENVELOPE):
@@ -228,8 +256,29 @@ def _make_envelope(status: int, value: SynValue) -> SynValue:
     )
 
 
+def _raw_text(value: Optional[SynValue]) -> str:
+    """Coerce a give-value to the raw text used as an html()/respond() body."""
+    if value is None:
+        return ""
+    if isinstance(value.type, SynText):
+        return value.raw
+    return str(value)
+
+
+def _make_raw(body: str, content_type: str, status: int) -> SynValue:
+    return SynValue(
+        raw={
+            "body": syn_text(body),
+            "content_type": syn_text(content_type),
+            "status": syn_number(status),
+        },
+        type=SynMap(),
+        metadata={_RAW: True},
+    )
+
+
 def register_serve_builtins(env):
-    """Register the response helpers: ok, created, not_found, fail."""
+    """Register the response helpers: ok, created, not_found, fail, html, respond."""
 
     def _ok(args: List[SynValue]) -> SynValue:
         value = args[0] if args else syn_nothing()
@@ -278,11 +327,30 @@ def register_serve_builtins(env):
         })
         return _make_envelope(code, body)
 
+    def _html(args: List[SynValue]) -> SynValue:
+        """html(content) → 200, text/html; charset=utf-8, body written verbatim."""
+        content = _raw_text(args[0]) if args else ""
+        return _make_raw(content, "text/html; charset=utf-8", 200)
+
+    def _respond(args: List[SynValue]) -> SynValue:
+        """
+        respond(content, content_type, status?) → body written verbatim with an
+        arbitrary Content-Type. respond("a,b", "text/csv"), respond(x, "text/html", 404).
+        """
+        content = _raw_text(args[0]) if args else ""
+        content_type = str(args[1].raw) if len(args) > 1 else "text/plain; charset=utf-8"
+        status = 200
+        if len(args) > 2 and isinstance(args[2].type, SynNumber):
+            status = int(args[2].raw)
+        return _make_raw(content, content_type, status)
+
     builtins = {
         "ok": BuiltinTask("ok", _ok, 1),
         "created": BuiltinTask("created", _created, 1),
         "not_found": BuiltinTask("not_found", _not_found, 1),
         "fail": BuiltinTask("fail", _fail, -1),
+        "html": BuiltinTask("html", _html, 1),
+        "respond": BuiltinTask("respond", _respond, -1),
     }
     for name, builtin in builtins.items():
         env.set(name, SynValue(raw=builtin, type=SynTask()))
@@ -340,13 +408,20 @@ class ServeRuntime:
     def __init__(self, port: int, routes: List[RouteSpec],
                  auth_handler: Optional[Callable[[str], Optional[SynValue]]] = None,
                  host: str = "0.0.0.0", max_body: Optional[int] = MAX_BODY,
-                 max_streams: int = DEFAULT_MAX_STREAMS):
+                 max_streams: int = DEFAULT_MAX_STREAMS,
+                 static_dir: Optional[str] = None,
+                 cors_origin: Optional[str] = None):
         self.port = int(port)
         self.host = host
         self.routes = routes
         self.auth_handler = auth_handler
         self.max_body = max_body  # bytes, or None for unlimited
         self.max_streams = int(max_streams)
+        # Static file root (realpath) — declared via `static "./dir"`. Its mere
+        # declaration is the permission to read from it (no file() capability).
+        self.static_dir = os.path.realpath(static_dir) if static_dir else None
+        # CORS origin — declared via `cors "*"` / `cors "https://app.com"`.
+        self.cors_origin = cors_origin
         self.httpd: Optional[ThreadingHTTPServer] = None
         self.thread: Optional[threading.Thread] = None
         self._stream_lock = threading.Lock()
@@ -392,6 +467,55 @@ class ServeRuntime:
             if params is not None:
                 return route, params
         return None, {}
+
+    # -- static files --
+
+    def _resolve_static(self, url_path: str) -> Optional[str]:
+        """
+        Map a URL path to a safe file inside static_dir, or None.
+
+        Blocks path traversal: the resolved real path must stay within the real
+        static root (defeats `../`, absolute paths, and symlinks escaping the dir).
+        '/' maps to index.html.
+        """
+        if not self.static_dir:
+            return None
+        rel = unquote(url_path).lstrip("/")
+        if rel == "":
+            rel = "index.html"
+        # An absolute path (or one os.path.join would treat as absolute) can't be
+        # inside a relative request — reject outright before joining.
+        if os.path.isabs(rel) or (len(rel) > 1 and rel[1] == ":"):
+            return None
+        target = os.path.realpath(os.path.join(self.static_dir, rel))
+        if target != self.static_dir and not target.startswith(self.static_dir + os.sep):
+            return None
+        if not os.path.isfile(target):
+            return None
+        return target
+
+    @staticmethod
+    def _static_content_type(path: str) -> str:
+        import mimetypes
+        ctype, _enc = mimetypes.guess_type(path)
+        if ctype is None:
+            return "application/octet-stream"
+        if ctype.startswith("text/") and "charset" not in ctype:
+            return f"{ctype}; charset=utf-8"
+        return ctype
+
+    def serve_static(self, url_path: str) -> Optional[RawResponse]:
+        """Return a RawResponse for a static file under static_dir, or None."""
+        target = self._resolve_static(url_path)
+        if target is None:
+            return None
+        try:
+            with open(target, "rb") as f:
+                data = f.read()
+        except OSError:
+            return None
+        return RawResponse(body=data, content_type=self._static_content_type(target),
+                           status=200)
 
     def methods_for_path(self, path: str) -> List[str]:
         """Methods of all routes whose path pattern matches (for 405 / Allow / OPTIONS)."""
@@ -443,12 +567,19 @@ class ServeRuntime:
             allowed = self.methods_for_path(path)
             if allowed:
                 # The path exists, but not for this method → 405, advertise Allow.
+                # Declared routes always win over static, so don't fall through.
                 return (
                     405,
                     {"error": "method not allowed", "status": 405},
                     {"Allow": ", ".join(allowed)},
                     None,
                 )
+            # No declared route at all: a GET/HEAD may be served from the static
+            # root, if one is configured. (HEAD reaches here as method "GET".)
+            if method == "GET" and self.static_dir:
+                raw = self.serve_static(path)
+                if raw is not None:
+                    return raw.status, raw, {}, None
             return 404, {"error": f"no route for {method} {path}", "status": 404}, {}, None
 
         # Rate limit AFTER matching the route, BEFORE auth/handler — so a
@@ -625,17 +756,33 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
     def _write(self, status: int, body_obj: Any,
                extra_headers: Dict[str, str] = None, write_body: bool = True):
-        payload = json.dumps(body_obj).encode("utf-8")
+        # A RawResponse (html/respond/static) is written verbatim; anything else
+        # follows the JSON contract.
+        if isinstance(body_obj, RawResponse):
+            body = body_obj.body
+            payload = body if isinstance(body, (bytes, bytearray)) else str(body).encode("utf-8")
+            content_type = body_obj.content_type
+        else:
+            payload = json.dumps(body_obj).encode("utf-8")
+            content_type = "application/json"
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         if self.close_connection:
             self.send_header("Connection", "close")
+        self._send_cors_headers()
         for k, v in (extra_headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
         if write_body:
             self.wfile.write(payload)
+
+    def _send_cors_headers(self):
+        """Emit Access-Control-Allow-Origin when the serve block declared cors."""
+        runtime = getattr(self.server, "runtime", None)
+        origin = getattr(runtime, "cors_origin", None) if runtime else None
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
 
     # -- body reading (counts real bytes, supports chunked, spills to disk) --
 
@@ -760,6 +907,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Accel-Buffering", "no")  # disable proxy buffering
             self.send_header("Connection", "close")
+            self._send_cors_headers()
             self.end_headers()
 
             if not write_body:
@@ -817,6 +965,12 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Allow", allow)
         self.send_header("Content-Length", "0")
+        # CORS preflight: advertise the methods/headers a browser may use.
+        if getattr(runtime, "cors_origin", None):
+            self.send_header("Access-Control-Allow-Origin", runtime.cors_origin)
+            self.send_header("Access-Control-Allow-Methods", allow)
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.send_header("Access-Control-Max-Age", "86400")
         self.end_headers()
 
     def log_message(self, *args):  # keep the server quiet

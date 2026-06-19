@@ -3,6 +3,7 @@ import os
 import sys
 import json
 import time
+import shutil
 import socket
 import tempfile
 import contextlib
@@ -1247,6 +1248,230 @@ def test_parse_body_size_units():
     assert parse_body_size(4096) == 4096
     assert parse_body_size("unlimited") is None
     assert parse_body_size("none") is None
+
+
+# ===== HTML / arbitrary content-types (html, respond) =====
+
+def test_html_helper_returns_raw_html():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /page"
+        give html("<h1>Hi</h1>")
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/page")
+        assert status == 200
+        assert headers.get("Content-Type") == "text/html; charset=utf-8"
+        assert raw == b"<h1>Hi</h1>"          # exact body, no JSON quoting
+
+
+def test_respond_arbitrary_content_type_and_status():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /csv"
+        give respond("a,b,c", "text/csv")
+    route "GET /xml"
+        give respond("<x/>", "application/xml", 201)
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/csv")
+        assert status == 200
+        assert headers.get("Content-Type") == "text/csv"
+        assert raw == b"a,b,c"
+        status, headers, raw = req.raw("GET", "/xml")
+        assert status == 201
+        assert headers.get("Content-Type") == "application/xml"
+        assert raw == b"<x/>"
+
+
+def test_give_string_is_json_not_html():
+    # give "<h1>Hi</h1>" is JSON (a quoted string), NOT a raw HTML page.
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /s"
+        give "<h1>Hi</h1>"
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/s")
+        assert status == 200
+        assert headers.get("Content-Type") == "application/json"
+        assert raw == b'"<h1>Hi</h1>"'
+        assert json.loads(raw) == "<h1>Hi</h1>"
+
+
+def test_give_map_still_json_with_raw_helpers_present():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /j"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/j")
+        assert headers.get("Content-Type") == "application/json"
+        assert json.loads(raw) == {"ok": True}
+
+
+# ===== Static file serving (static "./dir") =====
+
+@contextlib.contextmanager
+def _static_site(files: dict, outside: dict = None):
+    """Temp dir with a public/ subdir of `files`; `outside` files sit beside it.
+
+    Yields (public_path_with_forward_slashes, base_dir).
+    """
+    base = tempfile.mkdtemp(prefix="syn_static_test_")
+    pub = os.path.join(base, "public")
+    os.makedirs(pub)
+    for name, content in files.items():
+        path = os.path.join(pub, *name.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+    for name, content in (outside or {}).items():
+        with open(os.path.join(base, name), "w", encoding="utf-8") as f:
+            f.write(content)
+    try:
+        yield pub.replace("\\", "/"), base
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def _static_prog(pub: str, extra_routes: str = "") -> str:
+    return f"""
+require serve(__PORT__)
+serve on __PORT__
+    static "{pub}"
+    route "GET /api/ping"
+        give {{"ok": true}}
+{extra_routes}"""
+
+
+def test_static_serves_index_at_root():
+    with _static_site({"index.html": "<h1>Landing</h1>"}) as (pub, _base):
+        with serving(_static_prog(pub)) as req:
+            status, headers, raw = req.raw("GET", "/")
+            assert status == 200
+            assert raw == b"<h1>Landing</h1>"
+            assert headers.get("Content-Type", "").startswith("text/html")
+
+
+def test_static_content_type_by_extension():
+    with _static_site({"style.css": "body{color:red}"}) as (pub, _base):
+        with serving(_static_prog(pub)) as req:
+            status, headers, raw = req.raw("GET", "/style.css")
+            assert status == 200
+            assert raw == b"body{color:red}"
+            assert headers.get("Content-Type", "").startswith("text/css")
+
+
+def test_static_missing_file_404():
+    with _static_site({"index.html": "x"}) as (pub, _base):
+        with serving(_static_prog(pub)) as req:
+            status, body = req("GET", "/nope.png")
+            assert status == 404
+            assert body["status"] == 404
+
+
+def test_static_declared_route_wins_over_file():
+    with _static_site({"data.json": '{"from": "file"}'}) as (pub, _base):
+        prog = _static_prog(pub, '    route "GET /data.json"\n        give {"declared": true}\n')
+        with serving(prog) as req:
+            status, body = req("GET", "/data.json")
+            assert status == 200
+            assert body == {"declared": True}
+
+
+def test_static_path_traversal_blocked():
+    secret = "TOPSECRET-DO-NOT-LEAK"
+    with _static_site({"index.html": "<h1>ok</h1>"}, outside={"secret.txt": secret}) as (pub, _base):
+        with serving(_static_prog(pub)) as req:
+            for path in ("/../secret.txt", "/..%2f..%2fsecret.txt",
+                         "/..%2Fsecret.txt", "/%2e%2e/secret.txt"):
+                status, headers, raw = req.raw("GET", path)
+                assert secret.encode() not in raw, f"traversal leaked via {path}"
+                assert status == 404, f"{path} should be 404, got {status}"
+
+
+def test_static_post_not_served():
+    with _static_site({"index.html": "<h1>x</h1>"}) as (pub, _base):
+        with serving(_static_prog(pub)) as req:
+            status, headers, raw = req.raw("POST", "/index.html", body={"a": 1})
+            assert status == 404  # static is GET/HEAD only; no declared POST
+
+
+def test_static_head_has_no_body():
+    with _static_site({"index.html": "<h1>x</h1>"}) as (pub, _base):
+        with serving(_static_prog(pub)) as req:
+            status, headers, raw = req.raw("HEAD", "/")
+            assert status == 200
+            assert raw == b""
+            assert headers.get("Content-Type", "").startswith("text/html")
+
+
+# ===== CORS (cors "*" / cors "https://app.com") =====
+
+def test_cors_adds_allow_origin_wildcard():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    cors "*"
+    route "GET /x"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/x")
+        assert status == 200
+        assert headers.get("Access-Control-Allow-Origin") == "*"
+
+
+def test_cors_specific_origin_reflected():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    cors "https://app.example.com"
+    route "GET /x"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/x")
+        assert headers.get("Access-Control-Allow-Origin") == "https://app.example.com"
+
+
+def test_cors_preflight_options():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    cors "*"
+    route "GET /res"
+        give {"ok": true}
+    route "POST /res"
+        give created({"ok": true})
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("OPTIONS", "/res")
+        assert status == 204
+        assert headers.get("Access-Control-Allow-Origin") == "*"
+        methods = headers.get("Access-Control-Allow-Methods", "")
+        assert "GET" in methods and "POST" in methods
+        assert "Content-Type" in headers.get("Access-Control-Allow-Headers", "")
+        assert "Authorization" in headers.get("Access-Control-Allow-Headers", "")
+        assert headers.get("Access-Control-Max-Age") is not None
+
+
+def test_no_cors_no_headers():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /x"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/x")
+        assert headers.get("Access-Control-Allow-Origin") is None
 
 
 if __name__ == "__main__":
