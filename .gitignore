@@ -6,3 +6,20 @@ build/
 .eggs/
 *.json
 !examples/*.json
+
+# Rust
+target/
+**/*.rs.bk
+
+# Conformance: solo se versionan los runners .py (+ tpl/page.html como fixture);
+# el resto son artefactos GENERADOS por los runners (regenerables, y algunos con
+# rutas absolutas de la máquina). expected.json ya cae bajo *.json de arriba.
+conformance/**/*.syn
+conformance/serve_tmp/
+conformance/serve_static_dir/
+conformance/serve_static_dir2/
+conformance/a2_static/
+conformance/serve_secret.txt
+
+# Estado/persistencia y daemons de runtime (fuera del repo, defensivo)
+.syntecnia/

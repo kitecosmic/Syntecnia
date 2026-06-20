@@ -1,0 +1,7 @@
+-- A flat syntax program
+task double(x):
+    Give x * 2.
+end
+
+let nums be [1, 2, 3]
+For each n in nums, print(text(double(n))).
