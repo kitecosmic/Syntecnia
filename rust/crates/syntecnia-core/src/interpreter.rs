@@ -928,6 +928,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 None => Err(err_at("serve is only available through the Syntecnia engine runtime", loc)),
             },
             NodeKind::RateLimitClause { .. } => Ok(SynValue::Nothing),
+            NodeKind::ProxyStatement { .. } => {
+                Err(err_at("proxy is only available inside a serve route", loc))
+            }
             NodeKind::StreamBlock { body } => self.exec_block(body, env),
             NodeKind::SendStatement { value, event_name } => match self.stream_emit.clone() {
                 Some(emit) => {

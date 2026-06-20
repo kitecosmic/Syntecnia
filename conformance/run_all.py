@@ -61,6 +61,7 @@ RUNNERS = [
     ("A2 estáticos producción (etag/304/range/gzip)", ["run_a2.py"]),
     ("StatePersistence cross-run", ["run_statepersist.py"]),
     ("vhost (multi-dominio)", ["run_vhost.py"]),
+    ("reverse proxy", ["run_proxy.py"]),
 ]
 
 

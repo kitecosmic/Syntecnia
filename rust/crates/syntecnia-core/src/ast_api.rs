@@ -181,6 +181,7 @@ fn children(n: &Node) -> Vec<&Node> {
             v
         }
         StreamBlock { body } => body.iter().collect(),
+        ProxyStatement { target } => vec![target.as_ref()],
         SendStatement { value, .. } => vec![value],
         RateLimitClause { count, .. } => count.iter().map(|b| b.as_ref()).collect(),
         StaticMount { directory, prefix } => {
@@ -614,6 +615,7 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
             v
         }
         StreamBlock { body } => body.iter_mut().collect(),
+        ProxyStatement { target } => vec![target.as_mut()],
         SendStatement { value, .. } => vec![value.as_mut()],
         RateLimitClause { count, .. } => count.iter_mut().map(|b| b.as_mut()).collect(),
         StaticMount { directory, prefix } => {

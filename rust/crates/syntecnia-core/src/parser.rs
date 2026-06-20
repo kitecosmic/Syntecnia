@@ -298,6 +298,9 @@ impl Parser {
         if self.check_word("expect") && self.peek_word(1, "body") {
             return Ok(Some(self.parse_expect()?));
         }
+        if self.check_word("proxy") && self.peek(1).ty == TokenType::To {
+            return Ok(Some(self.parse_proxy()?));
+        }
 
         let tt = self.current().ty;
         let node = match tt {
@@ -1196,6 +1199,15 @@ impl Parser {
         ))
     }
 
+    /// `proxy to <url-expr>` (Lote 2): forward de la request al upstream.
+    fn parse_proxy(&mut self) -> Result<Node, ParseError> {
+        let loc = self.location();
+        self.advance(); // 'proxy'
+        self.expect(TokenType::To, "Expected 'to' after 'proxy' (proxy to \"http://upstream\")")?;
+        let target = self.parse_expression()?;
+        Ok(Node::new(loc, NodeKind::ProxyStatement { target: Box::new(target) }))
+    }
+
     fn parse_rate_limit(&mut self) -> Result<Node, ParseError> {
         let loc = self.location();
         self.advance(); // 'rate_limit'
@@ -1835,6 +1847,30 @@ mod tests {
         assert_eq!(prog.statements.len(), 2);
         assert!(matches!(prog.statements[0].kind, NodeKind::LetBinding { .. }));
         assert!(matches!(prog.statements[1].kind, NodeKind::TaskCall { .. }));
+    }
+
+    #[test]
+    fn parse_proxy_route() {
+        // `proxy to "..."` dentro de una route (Lote 2). `to` es TokenType::To, no
+        // un identifier — este test cubre el parseo (que un bug previo rompió).
+        let prog = parse_ok(
+            "require serve(8080)\nserve on 8080\n    route \"GET /up/*path\"\n        proxy to \"http://127.0.0.1:9000\"\n",
+        );
+        let serve = prog
+            .statements
+            .iter()
+            .find(|s| matches!(s.kind, NodeKind::ServeBlock { .. }))
+            .expect("serve block");
+        let NodeKind::ServeBlock { routes, .. } = &serve.kind else { unreachable!() };
+        assert_eq!(routes.len(), 1);
+        let NodeKind::RouteDefinition { body, .. } = &routes[0].kind else {
+            panic!("no es RouteDefinition")
+        };
+        assert_eq!(body.len(), 1, "el body de la route debería ser [ProxyStatement]");
+        assert!(
+            matches!(body[0].kind, NodeKind::ProxyStatement { .. }),
+            "el body de la route no es ProxyStatement"
+        );
     }
 
     #[test]

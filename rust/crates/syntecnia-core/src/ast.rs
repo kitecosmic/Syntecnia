@@ -272,6 +272,10 @@ pub enum NodeKind {
     StreamBlock {
         body: Vec<Node>,
     },
+    /// Lote 2 — reverse proxy: `proxy to <url>` dentro de una route → forwardea.
+    ProxyStatement {
+        target: Box<Node>,
+    },
     SendStatement {
         value: Box<Node>,
         event_name: Option<String>,

@@ -102,13 +102,15 @@ fn tls_serves_static_with_hsts() {
     let _ = tls.read_to_end(&mut resp);
     let text = String::from_utf8_lossy(&resp);
 
+    // hyper escribe los header names en minúscula (HTTP/2-style); chequeo case-insensitive.
+    let lower = text.to_lowercase();
     assert!(text.starts_with("HTTP/1.1 200"), "status inesperado: {}", text);
     assert!(
-        text.contains("Strict-Transport-Security: max-age=31536000; includeSubDomains"),
+        lower.contains("strict-transport-security: max-age=31536000; includesubdomains"),
         "falta HSTS: {}",
         text
     );
-    assert!(text.contains("ETag:"), "falta ETag en estático: {}", text);
+    assert!(lower.contains("etag:"), "falta ETag en estático: {}", text);
     assert!(text.contains("hola tls"), "falta el body: {}", text);
 }
 

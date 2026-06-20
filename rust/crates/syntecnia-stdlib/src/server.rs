@@ -16,15 +16,23 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use indexmap::IndexMap;
+
+// Lote 2 — rewrite async (hyper/tokio/rustls). El intérprete sigue sync (spawn_blocking).
+use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full, Limited};
+use hyper::body::{Frame, Incoming};
+use hyper::service::service_fn;
+use hyper::{Request, Response};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 
 use syntecnia_core::interpreter::Interpreter;
 use syntecnia_core::number::{py_float_str, Number};
@@ -680,6 +688,8 @@ pub struct RouteSpec {
     pub rate_zone: Option<String>,
     pub handler: Handler,
     pub stream_handler: Option<StreamHandler>,
+    /// Lote 2 — reverse proxy: si está, la route forwardea al upstream (URL base).
+    pub proxy_target: Option<String>,
 }
 
 /// Cuerpo de una respuesta HTTP.
@@ -1269,6 +1279,23 @@ impl ServeRuntime {
             }
         }
 
+        // Reverse proxy (Lote 2): forwardea la request al upstream y devuelve su
+        // respuesta (status + content-type + body verbatim).
+        if let Some(target) = &host.routes[idx].proxy_target {
+            return match proxy_forward(target, &ctx) {
+                Ok((status, content_type, body)) => Dispatched::Response {
+                    status,
+                    body: ResponseBody::Raw(RawResponse { body, content_type, status }),
+                    headers: rate_headers,
+                },
+                Err(e) => Dispatched::Response {
+                    status: 502,
+                    body: self.server_error(&format!("proxy error: {}", e)),
+                    headers: rate_headers,
+                },
+            };
+        }
+
         // Streaming SSE: adquirir slot y delegar al camino de stream.
         if host.routes[idx].streaming {
             if !self.try_acquire_stream() {
@@ -1321,6 +1348,114 @@ impl ServeRuntime {
         };
         Dispatched::Response { status, body, headers: rate_headers }
     }
+}
+
+// -- reverse proxy (Lote 2) --
+
+/// Forward sync de la request al upstream `http://host[:port][/base]`. Devuelve
+/// (status, content_type, body). Cliente HTTP/1.1 mínimo (Connection: close); corre
+/// dentro de spawn_blocking, así que bloquear está bien.
+fn proxy_forward(target: &str, ctx: &Ctx) -> Result<(u16, String, Vec<u8>), String> {
+    use std::io::Read;
+    let rest = target
+        .strip_prefix("http://")
+        .ok_or_else(|| "proxy target must start with http://".to_string())?;
+    let (authority, base) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let addr = if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{}:80", authority)
+    };
+    let base = base.trim_end_matches('/');
+    let mut fwd_path = format!("{}{}", base, ctx.path);
+    if !ctx.query.is_empty() {
+        let qs: Vec<String> = ctx.query.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+        fwd_path.push('?');
+        fwd_path.push_str(&qs.join("&"));
+    }
+
+    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("connect {}: {}", addr, e))?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let mut req = format!("{} {} HTTP/1.1\r\nHost: {}\r\n", ctx.method, fwd_path, authority);
+    for (k, v) in &ctx.headers {
+        let lk = k.to_lowercase();
+        // Saltar hop-by-hop / los que recalculamos.
+        if matches!(
+            lk.as_str(),
+            "host" | "connection" | "content-length" | "transfer-encoding" | "accept-encoding"
+        ) {
+            continue;
+        }
+        req.push_str(k);
+        req.push_str(": ");
+        req.push_str(v);
+        req.push_str("\r\n");
+    }
+    req.push_str(&format!("Content-Length: {}\r\nConnection: close\r\n\r\n", ctx.body.len()));
+    stream.write_all(req.as_bytes()).map_err(|e| format!("write head: {}", e))?;
+    stream.write_all(ctx.body.as_bytes()).map_err(|e| format!("write body: {}", e))?;
+    let _ = stream.flush();
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).map_err(|e| format!("read: {}", e))?;
+    parse_proxy_response(&raw)
+}
+
+fn parse_proxy_response(raw: &[u8]) -> Result<(u16, String, Vec<u8>), String> {
+    let pos = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| "malformed upstream response".to_string())?;
+    let head = String::from_utf8_lossy(&raw[..pos]);
+    let body_start = pos + 4;
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().unwrap_or("");
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| "bad upstream status line".to_string())?;
+    let mut content_type = "application/octet-stream".to_string();
+    let mut chunked = false;
+    for l in lines {
+        if let Some((k, v)) = l.split_once(':') {
+            let lk = k.trim().to_lowercase();
+            let vv = v.trim();
+            if lk == "content-type" {
+                content_type = vv.to_string();
+            } else if lk == "transfer-encoding" && vv.to_lowercase().contains("chunked") {
+                chunked = true;
+            }
+        }
+    }
+    let body_raw = &raw[body_start..];
+    let body = if chunked { dechunk(body_raw) } else { body_raw.to_vec() };
+    Ok((status, content_type, body))
+}
+
+/// De-chunk de un body `Transfer-Encoding: chunked`.
+fn dechunk(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        let nl = match data[i..].windows(2).position(|w| w == b"\r\n") {
+            Some(n) => n,
+            None => break,
+        };
+        let size_str = String::from_utf8_lossy(&data[i..i + nl]);
+        let size = usize::from_str_radix(size_str.trim().split(';').next().unwrap_or("").trim(), 16)
+            .unwrap_or(0);
+        i += nl + 2;
+        if size == 0 || i + size > data.len() {
+            break;
+        }
+        out.extend_from_slice(&data[i..i + size]);
+        i += size + 2; // chunk + CRLF
+    }
+    out
 }
 
 // -- helpers de matching/estáticos (libres) --
@@ -1937,176 +2072,6 @@ pub fn register_serve_builtins(interp: &Interpreter) {
 // Servidor HTTP (thread-per-connection, std::net)
 // =========================================================
 
-/// Stack grande por hilo de conexión: el handler corre un intérprete tree-walking
-/// (recursión profunda), igual que los hilos de agentes.
-const CONN_STACK_SIZE: usize = 256 * 1024 * 1024;
-
-/// Frase de razón de `http.HTTPStatus` (Python 3.12). Códigos fuera de ese set →
-/// "" (como `send_response_only` cuando el código no está en `responses`).
-fn reason(status: u16) -> &'static str {
-    match status {
-        100 => "Continue",
-        101 => "Switching Protocols",
-        102 => "Processing",
-        103 => "Early Hints",
-        200 => "OK",
-        201 => "Created",
-        202 => "Accepted",
-        203 => "Non-Authoritative Information",
-        204 => "No Content",
-        205 => "Reset Content",
-        206 => "Partial Content",
-        207 => "Multi-Status",
-        208 => "Already Reported",
-        226 => "IM Used",
-        300 => "Multiple Choices",
-        301 => "Moved Permanently",
-        302 => "Found",
-        303 => "See Other",
-        304 => "Not Modified",
-        305 => "Use Proxy",
-        307 => "Temporary Redirect",
-        308 => "Permanent Redirect",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        402 => "Payment Required",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        406 => "Not Acceptable",
-        407 => "Proxy Authentication Required",
-        408 => "Request Timeout",
-        409 => "Conflict",
-        410 => "Gone",
-        411 => "Length Required",
-        412 => "Precondition Failed",
-        413 => "Request Entity Too Large",
-        414 => "Request-URI Too Long",
-        415 => "Unsupported Media Type",
-        416 => "Requested Range Not Satisfiable",
-        417 => "Expectation Failed",
-        418 => "I'm a Teapot",
-        421 => "Misdirected Request",
-        422 => "Unprocessable Entity",
-        423 => "Locked",
-        424 => "Failed Dependency",
-        425 => "Too Early",
-        426 => "Upgrade Required",
-        428 => "Precondition Required",
-        429 => "Too Many Requests",
-        431 => "Request Header Fields Too Large",
-        451 => "Unavailable For Legal Reasons",
-        500 => "Internal Server Error",
-        501 => "Not Implemented",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        505 => "HTTP Version Not Supported",
-        506 => "Variant Also Negotiates",
-        507 => "Insufficient Storage",
-        508 => "Loop Detected",
-        510 => "Not Extended",
-        511 => "Network Authentication Required",
-        _ => "",
-    }
-}
-
-enum BodyRead {
-    Bytes(Vec<u8>),
-    /// Body grande spilled a un temp file (el caller lo borra al terminar).
-    File(PathBuf),
-    TooLarge,
-}
-
-/// Path único para un body spilled (como tempfile.mkstemp(prefix="syn_body_")).
-fn spill_path() -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("syn_body_{}_{}", std::process::id(), n))
-}
-
-/// Procesa un bloque del body: cuenta bytes, spillea a disco si supera `spill_at`.
-/// Devuelve false si excede `max_body` (→ TooLarge).
-fn feed_block(
-    block: &[u8],
-    total: &mut usize,
-    buf: &mut Vec<u8>,
-    tmp: &mut Option<(File, PathBuf)>,
-    max_body: Option<i64>,
-    spill_at: usize,
-) -> bool {
-    if block.is_empty() {
-        return true;
-    }
-    *total += block.len();
-    if let Some(mb) = max_body {
-        if *total as i64 > mb {
-            return false;
-        }
-    }
-    if tmp.is_none() {
-        buf.extend_from_slice(block);
-        if buf.len() > spill_at {
-            let path = spill_path();
-            if let Ok(mut f) = File::create(&path) {
-                let _ = f.write_all(buf);
-                buf.clear();
-                *tmp = Some((f, path));
-            }
-        }
-    } else if let Some((f, _)) = tmp.as_mut() {
-        let _ = f.write_all(block);
-    }
-    true
-}
-
-/// Loop de accept: un hilo (con stack grande) por conexión. Bloquea para siempre.
-pub fn serve_forever(rt: Arc<ServeRuntime>, listener: TcpListener) {
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let _ = stream.set_nodelay(true);
-        let client_ip = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
-        let rt = rt.clone();
-        let _ = std::thread::Builder::new()
-            .stack_size(CONN_STACK_SIZE)
-            .spawn(move || {
-                let _ = handle_connection(rt, stream, client_ip);
-            });
-    }
-}
-
-/// A2 — Loop de accept TLS: igual que `serve_forever` pero envuelve cada conexión
-/// en rustls (backend ring). El handshake ocurre perezosamente al primer read; si
-/// falla, esa conexión se cierra limpiamente sin tirar el servidor.
-pub fn serve_forever_tls(
-    rt: Arc<ServeRuntime>,
-    listener: TcpListener,
-    config: Arc<rustls::ServerConfig>,
-) {
-    for stream in listener.incoming() {
-        let tcp = match stream {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let _ = tcp.set_nodelay(true);
-        let client_ip = tcp.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
-        let conn = match rustls::ServerConnection::new(config.clone()) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let rt = rt.clone();
-        let _ = std::thread::Builder::new()
-            .stack_size(CONN_STACK_SIZE)
-            .spawn(move || {
-                let tls = rustls::StreamOwned::new(conn, tcp);
-                let _ = handle_connection(rt, tls, client_ip);
-            });
-    }
-}
-
 /// A2 batch 2 — Mapa compartido token→key-authorization que el listener HTTP sirve
 /// para los challenges ACME HTTP-01.
 pub type ChallengeStore = std::sync::Arc<std::sync::Mutex<HashMap<String, String>>>;
@@ -2114,33 +2079,392 @@ pub type ChallengeStore = std::sync::Arc<std::sync::Mutex<HashMap<String, String
 /// A2 batch 2 — Config TLS compartida y mutable (renovación ACME hace hot-swap).
 pub type SharedServerConfig = std::sync::Arc<std::sync::RwLock<Arc<rustls::ServerConfig>>>;
 
-/// A2 batch 2 — Igual que `serve_forever_tls` pero lee la config desde una celda
-/// compartida en cada accept, para que la renovación ACME pueda hot-swappear el cert
-/// sin reiniciar el server.
-pub fn serve_forever_tls_auto(
-    rt: Arc<ServeRuntime>,
-    listener: TcpListener,
-    config: SharedServerConfig,
-) {
-    for stream in listener.incoming() {
-        let tcp = match stream {
-            Ok(s) => s,
-            Err(_) => continue,
+// =========================================================
+// Lote 2 — Servidor async (tokio/hyper/rustls)
+// =========================================================
+//
+// Cáscara async: tokio acepta, hyper hace el framing HTTP/1.1+HTTP/2 (ALPN), y el
+// intérprete corre SYNC por request en `spawn_blocking` (igual modelo snapshot-globales
+// que antes). El `dispatch` se reusa intacto → mismas respuestas (byte-paridad sobre
+// HTTP/1.1; el harness compara status+headers+body parseados).
+
+/// Cuerpo de respuesta unificado (Full para sized, canal para SSE).
+type RespBody = BoxBody<Bytes, std::convert::Infallible>;
+
+/// Stack grande para los hilos del runtime (worker + blocking): el intérprete tiene
+/// guard de recursión, pero le damos holgura como el viejo thread-per-conn.
+const SERVE_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+#[derive(Clone)]
+enum TlsMode {
+    Plain,
+    Fixed(Arc<rustls::ServerConfig>),
+    Swap(SharedServerConfig),
+}
+
+/// Loop de accept async. Bloquea para siempre (arma su propio runtime tokio).
+pub fn serve_forever(rt: Arc<ServeRuntime>, listener: TcpListener) {
+    run_async(rt, listener, TlsMode::Plain);
+}
+
+/// HTTPS con cert fijo (TLS manual). Bind/handshake fallido cierra esa conexión.
+pub fn serve_forever_tls(rt: Arc<ServeRuntime>, listener: TcpListener, config: Arc<rustls::ServerConfig>) {
+    run_async(rt, listener, TlsMode::Fixed(config));
+}
+
+/// HTTPS con cert hot-swappable (renovación ACME): lee la config por accept.
+pub fn serve_forever_tls_auto(rt: Arc<ServeRuntime>, listener: TcpListener, config: SharedServerConfig) {
+    run_async(rt, listener, TlsMode::Swap(config));
+}
+
+fn run_async(rt: Arc<ServeRuntime>, listener: TcpListener, tls: TlsMode) {
+    let _ = listener.set_nonblocking(true);
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(SERVE_STACK_SIZE)
+        .build()
+    {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    runtime.block_on(async move {
+        let listener = match tokio::net::TcpListener::from_std(listener) {
+            Ok(l) => l,
+            Err(_) => return,
         };
-        let _ = tcp.set_nodelay(true);
-        let client_ip = tcp.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
-        let cfg = config.read().unwrap().clone();
-        let conn = match rustls::ServerConnection::new(cfg) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let rt = rt.clone();
-        let _ = std::thread::Builder::new()
-            .stack_size(CONN_STACK_SIZE)
-            .spawn(move || {
-                let tls = rustls::StreamOwned::new(conn, tcp);
-                let _ = handle_connection(rt, tls, client_ip);
+        loop {
+            let (tcp, peer) = match listener.accept().await {
+                Ok(x) => x,
+                Err(_) => continue,
+            };
+            let _ = tcp.set_nodelay(true);
+            let client_ip = peer.ip().to_string();
+            let rt = rt.clone();
+            let tls = tls.clone();
+            tokio::spawn(async move {
+                serve_conn(rt, tcp, client_ip, tls).await;
             });
+        }
+    });
+}
+
+async fn serve_conn(rt: Arc<ServeRuntime>, tcp: tokio::net::TcpStream, client_ip: String, tls: TlsMode) {
+    let svc = {
+        let rt = rt.clone();
+        let ip = client_ip.clone();
+        service_fn(move |req: Request<Incoming>| {
+            let rt = rt.clone();
+            let ip = ip.clone();
+            async move { handle_request(rt, req, ip).await }
+        })
+    };
+    // auto::Builder negocia HTTP/1.1 o HTTP/2 (ALPN h2 sobre TLS; h2c o 1.1 en claro).
+    let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    match tls {
+        TlsMode::Plain => {
+            let io = TokioIo::new(tcp);
+            let _ = builder.serve_connection(io, svc).await;
+        }
+        TlsMode::Fixed(cfg) => {
+            let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+            if let Ok(stream) = acceptor.accept(tcp).await {
+                let io = TokioIo::new(stream);
+                let _ = builder.serve_connection(io, svc).await;
+            }
+        }
+        TlsMode::Swap(cell) => {
+            let cfg = match cell.read() {
+                Ok(g) => g.clone(),
+                Err(_) => return,
+            };
+            let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+            if let Ok(stream) = acceptor.accept(tcp).await {
+                let io = TokioIo::new(stream);
+                let _ = builder.serve_connection(io, svc).await;
+            }
+        }
+    }
+}
+
+/// Cabecera resuelta por el `spawn_blocking` (status + headers); el body llega aparte.
+struct HeadInfo {
+    status: u16,
+    content_type: Option<String>,
+    extra: Vec<(String, String)>,
+    streaming: bool,
+    close: bool,
+    cors: Option<String>,
+    hsts: bool,
+}
+
+/// Body respaldado por un canal mpsc (SSE: frames a medida que el handler emite).
+struct ChannelBody {
+    rx: tokio::sync::mpsc::Receiver<Bytes>,
+}
+impl hyper::body::Body for ChannelBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Bytes>, std::convert::Infallible>>> {
+        match self.rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(b)) => std::task::Poll::Ready(Some(Ok(Frame::data(b)))),
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+fn response_body_bytes(body: ResponseBody) -> (String, Bytes) {
+    match body {
+        ResponseBody::Json(j) => ("application/json".to_string(), Bytes::from(dumps(&j))),
+        ResponseBody::Raw(r) => (r.content_type, Bytes::from(r.body)),
+    }
+}
+
+/// Emisor SSE respaldado por el canal: formatea `[event:..\n]data:<json>\n\n`.
+fn channel_emitter(tx: tokio::sync::mpsc::Sender<Bytes>) -> Emitter {
+    Box::new(move |value: &SynValue, event: Option<&str>| -> Result<(), StreamGone> {
+        let mut payload = String::new();
+        if let Some(e) = event {
+            payload.push_str("event: ");
+            payload.push_str(e);
+            payload.push('\n');
+        }
+        payload.push_str("data: ");
+        payload.push_str(&dumps(&syn_to_json(value)));
+        payload.push_str("\n\n");
+        tx.blocking_send(Bytes::from(payload)).map_err(|_| StreamGone)
+    })
+}
+
+/// Construye un `Response` JSON sized (errores 4xx/5xx fuera del dispatch).
+fn json_full(
+    status: u16,
+    body: String,
+    extra: &[(String, String)],
+    cors: Option<&str>,
+    hsts: bool,
+    close: bool,
+) -> Response<RespBody> {
+    let mut builder = Response::builder().status(status).header("Content-Type", "application/json");
+    if close {
+        builder = builder.header("Connection", "close");
+    }
+    if let Some(o) = cors {
+        builder = builder.header("Access-Control-Allow-Origin", o);
+    }
+    if hsts {
+        builder = builder.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    }
+    for (k, v) in extra {
+        builder = builder.header(k, v);
+    }
+    builder.body(Full::new(Bytes::from(body)).boxed()).unwrap()
+}
+
+/// OPTIONS: 204 + Allow (+ CORS si está). Espeja `handle_options` del path viejo.
+fn build_options_response(rt: &ServeRuntime, path: &str) -> Response<RespBody> {
+    let allowed = rt.methods_for_path(path);
+    if allowed.is_empty() {
+        let body = obj(vec![
+            ("error", Json::Str(format!("no route for {}", path))),
+            ("status", Json::Int(404)),
+        ]);
+        return json_full(404, dumps(&body), &[], rt.cors_origin(), rt.tls_enabled, false);
+    }
+    let mut set = allowed;
+    set.push("OPTIONS".to_string());
+    set.push("HEAD".to_string());
+    set.sort();
+    set.dedup();
+    let allow = set.join(", ");
+    let mut builder = Response::builder()
+        .status(204)
+        .header("Allow", &allow)
+        .header("Content-Length", "0");
+    if let Some(o) = rt.cors_origin() {
+        builder = builder
+            .header("Access-Control-Allow-Origin", o)
+            .header("Access-Control-Allow-Methods", &allow)
+            .header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            .header("Access-Control-Max-Age", "86400");
+    }
+    if rt.tls_enabled {
+        builder = builder.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    }
+    builder.body(Full::new(Bytes::new()).boxed()).unwrap()
+}
+
+/// Lee el body respetando `max_body` (excedido → Err → 413).
+async fn read_req_body(body: Incoming, max: Option<i64>) -> Result<Bytes, ()> {
+    match max {
+        Some(m) => {
+            let lim = m.max(0) as usize;
+            match Limited::new(body, lim).collect().await {
+                Ok(c) => Ok(c.to_bytes()),
+                Err(_) => Err(()),
+            }
+        }
+        None => match body.collect().await {
+            Ok(c) => Ok(c.to_bytes()),
+            Err(_) => Err(()),
+        },
+    }
+}
+
+/// Path único para un body spilled a disco (como tempfile del oráculo).
+fn spill_path() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("syn_body_{}_{}", std::process::id(), n))
+}
+
+async fn handle_request(
+    rt: Arc<ServeRuntime>,
+    req: Request<Incoming>,
+    client_ip: String,
+) -> Result<Response<RespBody>, std::convert::Infallible> {
+    let method = req.method().as_str().to_string();
+    let target = match req.uri().path_and_query() {
+        Some(pq) => pq.as_str().to_string(),
+        None => req.uri().path().to_string(),
+    };
+    let (path, query) = parse_path_query(&target);
+    let headers: Vec<(String, String)> = req
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+
+    if method == "OPTIONS" {
+        return Ok(build_options_response(&rt, &path));
+    }
+    let is_head = method == "HEAD";
+    let eff_method = if is_head { "GET".to_string() } else { method.clone() };
+
+    let cors = rt.cors_origin().map(|s| s.to_string());
+    let hsts = rt.tls_enabled;
+
+    // Body con tope; excedido → 413 + cerrar.
+    let body_bytes = match read_req_body(req.into_body(), rt.max_body).await {
+        Ok(b) => b,
+        Err(()) => {
+            let body = obj(vec![
+                ("error", Json::Str("payload too large".into())),
+                ("status", Json::Int(413)),
+            ]);
+            return Ok(json_full(413, dumps(&body), &[], cors.as_deref(), hsts, true));
+        }
+    };
+    // Spill a disco igual que el oráculo: bodies > MEM_SPILL no van en memoria (el
+    // `body` string queda vacío; el handler lo lee del file vía body_file).
+    let (body_str, body_file): (String, Option<PathBuf>) = if body_bytes.len() > MEM_SPILL {
+        let p = spill_path();
+        let _ = std::fs::write(&p, &body_bytes);
+        (String::new(), Some(p))
+    } else {
+        (String::from_utf8_lossy(&body_bytes).into_owned(), None)
+    };
+
+    // dispatch + (si stream) correr el handler dentro de spawn_blocking; head por
+    // oneshot, body por mpsc (1 frame para sized, N frames para SSE).
+    let (head_tx, head_rx) = tokio::sync::oneshot::channel::<HeadInfo>();
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Bytes>(16);
+    let rt2 = rt.clone();
+    let cors_b = cors.clone();
+    tokio::task::spawn_blocking(move || {
+        let bf = body_file.as_ref().map(|p| p.to_string_lossy().into_owned());
+        match rt2.dispatch(&eff_method, &path, query, headers, &body_str, bf.as_deref(), &client_ip) {
+            Dispatched::Response { status, body, headers: extra } => {
+                let (ct, bytes) = response_body_bytes(body);
+                let _ = head_tx.send(HeadInfo {
+                    status,
+                    content_type: Some(ct),
+                    extra,
+                    streaming: false,
+                    close: false,
+                    cors: cors_b,
+                    hsts,
+                });
+                let _ = body_tx.blocking_send(bytes);
+            }
+            Dispatched::Stream { stream_handler, ctx } => {
+                let _ = head_tx.send(HeadInfo {
+                    status: 200,
+                    content_type: Some("text/event-stream".to_string()),
+                    extra: vec![
+                        ("Cache-Control".to_string(), "no-cache".to_string()),
+                        ("X-Accel-Buffering".to_string(), "no".to_string()),
+                    ],
+                    streaming: true,
+                    close: true,
+                    cors: cors_b,
+                    hsts,
+                });
+                if let Some(sh) = stream_handler {
+                    let emit = channel_emitter(body_tx.clone());
+                    if let StreamEnd::Error(msg) = sh(&ctx, emit) {
+                        let err = format!(
+                            "event: error\ndata: {}\n\n",
+                            dumps(&obj(vec![("error", Json::Str(msg))]))
+                        );
+                        let _ = body_tx.blocking_send(Bytes::from(err));
+                    }
+                }
+                rt2.release_stream();
+            }
+        }
+        // Limpia el body spilled a disco (si lo hubo).
+        if let Some(p) = &body_file {
+            let _ = std::fs::remove_file(p);
+        }
+    });
+
+    let head = match head_rx.await {
+        Ok(h) => h,
+        Err(_) => {
+            let body = obj(vec![
+                ("error", Json::Str("internal server error".into())),
+                ("status", Json::Int(500)),
+            ]);
+            return Ok(json_full(500, dumps(&body), &[], cors.as_deref(), hsts, false));
+        }
+    };
+
+    let mut builder = Response::builder().status(head.status);
+    if let Some(ct) = &head.content_type {
+        builder = builder.header("Content-Type", ct);
+    }
+    if head.close {
+        builder = builder.header("Connection", "close");
+    }
+    if let Some(o) = &head.cors {
+        builder = builder.header("Access-Control-Allow-Origin", o);
+    }
+    if head.hsts {
+        builder = builder.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    }
+    for (k, v) in &head.extra {
+        builder = builder.header(k, v);
+    }
+
+    let mut body_rx = body_rx;
+    if head.streaming {
+        let body = ChannelBody { rx: body_rx }.boxed();
+        Ok(builder.body(body).unwrap())
+    } else {
+        // sized: 1 frame con el body completo → Full (hyper pone Content-Length).
+        let bytes = body_rx.recv().await.unwrap_or_default();
+        if is_head {
+            // HEAD: mismo Content-Length, sin cuerpo.
+            builder = builder.header("Content-Length", bytes.len().to_string());
+            Ok(builder.body(Full::new(Bytes::new()).boxed()).unwrap())
+        } else {
+            Ok(builder.body(Full::new(bytes).boxed()).unwrap())
+        }
     }
 }
 
@@ -2232,6 +2556,10 @@ pub fn build_tls_config(cert_path: &str, key_path: &str) -> Result<Arc<rustls::S
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| format!("TLS cert/key mismatch: {}", e))?;
+    // Lote 2 — HTTP/2: anunciar h2 (y http/1.1 fallback) por ALPN. El auto::Builder
+    // sirve HTTP/2 cuando el cliente negocia h2; si no, HTTP/1.1.
+    let mut config = config;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Arc::new(config))
 }
 
@@ -2309,6 +2637,8 @@ pub fn build_tls_config_sni(
         .map_err(|e| format!("TLS config error: {}", e))?
         .with_no_client_auth()
         .with_cert_resolver(resolver);
+    let mut config = config;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Arc::new(config))
 }
 
@@ -2350,18 +2680,6 @@ fn redirect_one(stream: TcpStream, https_port: u16) -> io::Result<()> {
     stream.flush()
 }
 
-fn send_head<W: Write>(stream: &mut W, status: u16, headers: &[(String, String)]) -> io::Result<()> {
-    let mut h = format!("HTTP/1.1 {} {}\r\n", status, reason(status));
-    for (k, v) in headers {
-        h.push_str(k);
-        h.push_str(": ");
-        h.push_str(v);
-        h.push_str("\r\n");
-    }
-    h.push_str("\r\n");
-    stream.write_all(h.as_bytes())
-}
-
 fn read_request_head<R: BufRead>(
     reader: &mut R,
 ) -> Option<(String, String, String, Vec<(String, String)>)> {
@@ -2394,327 +2712,10 @@ fn read_request_head<R: BufRead>(
     Some((method, target, version, headers))
 }
 
-fn read_body<R: BufRead>(
-    reader: &mut R,
-    headers: &[(String, String)],
-    max_body: Option<i64>,
-) -> BodyRead {
-    // Spillea a disco sobre MEM_SPILL (capado a max_body). Cuenta bytes reales,
-    // nunca confía en Content-Length.
-    let spill_at = match max_body {
-        None => MEM_SPILL,
-        Some(mb) => (mb.max(0) as usize).min(MEM_SPILL),
-    };
-    let mut total: usize = 0;
-    let mut buf: Vec<u8> = Vec::new();
-    let mut tmp: Option<(File, PathBuf)> = None;
-    let mut too_large = false;
-
-    let te = header_value(headers, "transfer-encoding").to_lowercase();
-    if te.contains("chunked") {
-        loop {
-            let mut size_line = String::new();
-            if reader.read_line(&mut size_line).unwrap_or(0) == 0 {
-                break;
-            }
-            let hex = size_line.trim().split(';').next().unwrap_or("").trim().to_string();
-            if hex.is_empty() {
-                continue;
-            }
-            let sz = match usize::from_str_radix(&hex, 16) {
-                Ok(s) => s,
-                Err(_) => break,
-            };
-            if sz == 0 {
-                let mut crlf = String::new();
-                let _ = reader.read_line(&mut crlf);
-                break;
-            }
-            let mut chunk = vec![0u8; sz];
-            if reader.read_exact(&mut chunk).is_err() {
-                break;
-            }
-            if !feed_block(&chunk, &mut total, &mut buf, &mut tmp, max_body, spill_at) {
-                too_large = true;
-                break;
-            }
-            let mut crlf = String::new();
-            let _ = reader.read_line(&mut crlf);
-        }
-    } else {
-        let mut remaining: usize =
-            header_value(headers, "content-length").trim().parse().unwrap_or(0);
-        let mut block = vec![0u8; 65536];
-        while remaining > 0 {
-            let want = remaining.min(block.len());
-            let n = match reader.read(&mut block[..want]) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            if !feed_block(&block[..n], &mut total, &mut buf, &mut tmp, max_body, spill_at) {
-                too_large = true;
-                break;
-            }
-            remaining -= n;
-        }
-    }
-
-    if too_large {
-        if let Some((_, path)) = tmp {
-            let _ = std::fs::remove_file(path);
-        }
-        return BodyRead::TooLarge;
-    }
-    match tmp {
-        Some((_, path)) => BodyRead::File(path),
-        None => BodyRead::Bytes(buf),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_response<W: Write>(
-    stream: &mut W,
-    status: u16,
-    body: ResponseBody,
-    extra: &[(String, String)],
-    close: bool,
-    cors: Option<&str>,
-    write_body: bool,
-    hsts: bool,
-) -> io::Result<()> {
-    let (ct, payload) = match body {
-        ResponseBody::Json(j) => ("application/json".to_string(), dumps(&j).into_bytes()),
-        ResponseBody::Raw(r) => (r.content_type, r.body),
-    };
-    let mut headers = vec![
-        ("Content-Type".to_string(), ct),
-        ("Content-Length".to_string(), payload.len().to_string()),
-    ];
-    if close {
-        headers.push(("Connection".to_string(), "close".to_string()));
-    }
-    if let Some(o) = cors {
-        headers.push(("Access-Control-Allow-Origin".to_string(), o.to_string()));
-    }
-    if hsts {
-        headers.push((
-            "Strict-Transport-Security".to_string(),
-            "max-age=31536000; includeSubDomains".to_string(),
-        ));
-    }
-    for (k, v) in extra {
-        headers.push((k.clone(), v.clone()));
-    }
-    send_head(stream, status, &headers)?;
-    if write_body {
-        stream.write_all(&payload)?;
-    }
-    stream.flush()
-}
-
-fn handle_options<W: Write>(
-    rt: &ServeRuntime,
-    stream: &mut W,
-    path: &str,
-) -> io::Result<()> {
-    let allowed = rt.methods_for_path(path);
-    if allowed.is_empty() {
-        return write_response(
-            stream,
-            404,
-            ResponseBody::Json(obj(vec![
-                ("error", Json::Str(format!("no route for {}", path))),
-                ("status", Json::Int(404)),
-            ])),
-            &[],
-            false,
-            rt.cors_origin(),
-            true,
-            rt.tls_enabled,
-        );
-    }
-    let mut set = allowed;
-    set.push("OPTIONS".to_string());
-    set.push("HEAD".to_string());
-    set.sort();
-    set.dedup();
-    let allow = set.join(", ");
-    let mut headers = vec![
-        ("Allow".to_string(), allow.clone()),
-        ("Content-Length".to_string(), "0".to_string()),
-    ];
-    if let Some(o) = rt.cors_origin() {
-        headers.push(("Access-Control-Allow-Origin".to_string(), o.to_string()));
-        headers.push(("Access-Control-Allow-Methods".to_string(), allow.clone()));
-        headers.push(("Access-Control-Allow-Headers".to_string(), "Content-Type, Authorization".to_string()));
-        headers.push(("Access-Control-Max-Age".to_string(), "86400".to_string()));
-    }
-    if rt.tls_enabled {
-        headers.push((
-            "Strict-Transport-Security".to_string(),
-            "max-age=31536000; includeSubDomains".to_string(),
-        ));
-    }
-    send_head(stream, 204, &headers)?;
-    stream.flush()
-}
-
-/// Emisor SSE: comparte el writer (`Rc<RefCell<S>>`), formatea
-/// `[event: <e>\n]data: <json>\n\n` y escribe+flush. Falla con `StreamGone` si el
-/// cliente se desconectó. Genérico sobre el transporte (TCP o TLS).
-fn make_emitter<S: Write + 'static>(writer: Rc<RefCell<S>>) -> Emitter {
-    Box::new(move |value: &SynValue, event: Option<&str>| -> Result<(), StreamGone> {
-        let mut payload = String::new();
-        if let Some(e) = event {
-            payload.push_str("event: ");
-            payload.push_str(e);
-            payload.push('\n');
-        }
-        payload.push_str("data: ");
-        payload.push_str(&dumps(&syn_to_json(value)));
-        payload.push_str("\n\n");
-        let mut w = writer.borrow_mut();
-        w.write_all(payload.as_bytes()).map_err(|_| StreamGone)?;
-        w.flush().map_err(|_| StreamGone)?;
-        Ok(())
-    })
-}
-
-fn write_stream<S: Write + 'static>(
-    rt: &ServeRuntime,
-    stream: S,
-    stream_handler: Option<StreamHandler>,
-    ctx: &Ctx,
-    write_body: bool,
-    hsts: bool,
-) -> io::Result<()> {
-    let shared = Rc::new(RefCell::new(stream));
-    let mut headers = vec![
-        ("Content-Type".to_string(), "text/event-stream".to_string()),
-        ("Cache-Control".to_string(), "no-cache".to_string()),
-        ("X-Accel-Buffering".to_string(), "no".to_string()),
-        ("Connection".to_string(), "close".to_string()),
-    ];
-    if let Some(o) = rt.cors_origin() {
-        headers.push(("Access-Control-Allow-Origin".to_string(), o.to_string()));
-    }
-    if hsts {
-        headers.push((
-            "Strict-Transport-Security".to_string(),
-            "max-age=31536000; includeSubDomains".to_string(),
-        ));
-    }
-    send_head(&mut *shared.borrow_mut(), 200, &headers)?;
-    if write_body {
-        if let Some(sh) = stream_handler {
-            let emit = make_emitter(shared.clone());
-            // Headers ya enviados; si el handler falla (no por desconexión) se emite
-            // un evento de error best-effort (no se puede cambiar el status).
-            if let StreamEnd::Error(msg) = sh(ctx, emit) {
-                let err = format!(
-                    "event: error\ndata: {}\n\n",
-                    dumps(&obj(vec![("error", Json::Str(msg))]))
-                );
-                let mut w = shared.borrow_mut();
-                let _ = w.write_all(err.as_bytes());
-                let _ = w.flush();
-            }
-        }
-    }
-    rt.release_stream();
-    let _ = shared.borrow_mut().flush();
-    Ok(())
-}
-
-fn handle_connection<S: Read + Write + 'static>(
-    rt: Arc<ServeRuntime>,
-    stream: S,
-    client_ip: String,
-) -> io::Result<()> {
-    let hsts = rt.tls_enabled;
-    let mut reader = BufReader::new(stream);
-
-    loop {
-        let (method, target, version, headers) = match read_request_head(&mut reader) {
-            Some(x) => x,
-            None => break,
-        };
-        let conn = header_value(&headers, "connection").to_lowercase();
-        let close = if version == "HTTP/1.0" {
-            conn != "keep-alive"
-        } else {
-            conn == "close"
-        };
-
-        let (path, query) = parse_path_query(&target);
-
-        if method == "OPTIONS" {
-            handle_options(&rt, reader.get_mut(), &path)?;
-            if close {
-                break;
-            }
-            continue;
-        }
-
-        // HEAD = GET sin body.
-        let (eff_method, write_body) = if method == "HEAD" {
-            ("GET".to_string(), false)
-        } else {
-            (method.clone(), true)
-        };
-
-        let (body_str, body_file): (String, Option<PathBuf>) =
-            match read_body(&mut reader, &headers, rt.max_body) {
-                BodyRead::TooLarge => {
-                    // 413 + cerrar: no dejar un body sin leer en una conexión keep-alive.
-                    write_response(
-                        reader.get_mut(),
-                        413,
-                        ResponseBody::Json(obj(vec![
-                            ("error", Json::Str("payload too large".into())),
-                            ("status", Json::Int(413)),
-                        ])),
-                        &[],
-                        true,
-                        rt.cors_origin(),
-                        write_body,
-                        hsts,
-                    )?;
-                    break;
-                }
-                BodyRead::Bytes(b) => (String::from_utf8_lossy(&b).into_owned(), None),
-                // Body grande spilled: body vacío en memoria; read_body() lo lee del file.
-                BodyRead::File(p) => (String::new(), Some(p)),
-            };
-        let bf = body_file.as_ref().map(|p| p.to_string_lossy().into_owned());
-
-        match rt.dispatch(&eff_method, &path, query, headers, &body_str, bf.as_deref(), &client_ip) {
-            Dispatched::Response { status, body, headers: extra } => {
-                write_response(reader.get_mut(), status, body, &extra, close, rt.cors_origin(), write_body, hsts)?;
-            }
-            Dispatched::Stream { stream_handler, ctx } => {
-                let stream = reader.into_inner();
-                write_stream(&rt, stream, stream_handler, &ctx, write_body, hsts)?;
-                if let Some(p) = &body_file {
-                    let _ = std::fs::remove_file(p);
-                }
-                break; // MVP: un stream por conexión, luego cierra
-            }
-        }
-
-        if let Some(p) = &body_file {
-            let _ = std::fs::remove_file(p);
-        }
-        if close {
-            break;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read; // GzDecoder::read_to_end en los tests de gzip
 
     #[test]
     fn specificity_ordering() {

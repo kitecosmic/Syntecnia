@@ -11,10 +11,13 @@ import socket, subprocess, time, http.client, os, sys, json, contextlib
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUST = os.path.join(REPO, "rust", "target", "release", "syntecnia-cli.exe")
 ORACLE = os.path.join(REPO, "conformance", "_serve_oracle.py")
-# server/date: volátiles. etag/accept-ranges: additive de estáticos de producción
-# (A2, post-paridad) que el oráculo congelado no emite → se ignoran al comparar
-# paridad; su CORRECCIÓN se gatea aparte en run_a2.py.
-IGNORE_HEADERS = {"server", "date", "etag", "accept-ranges"}
+# server/date: volátiles. etag/accept-ranges: additive de estáticos de producción.
+# transfer-encoding/connection: framing de transporte (Lote 2) — hyper chunkea SSE
+# en vez de close-delimited; RFC-compliant y semánticamente idéntico (eventos iguales).
+# Todos son framing/additive, NO semántica → se ignoran al comparar paridad; la
+# corrección de etag/304/range/gzip se gatea en run_a2.py.
+IGNORE_HEADERS = {"server", "date", "etag", "accept-ranges",
+                  "transfer-encoding", "connection"}
 
 
 def free_port():
@@ -44,6 +47,8 @@ def _send(port, method, path, body=None, headers=None):
     r = conn.getresponse()
     data = r.read()
     hdrs = {k.lower(): v for k, v in r.getheaders() if k.lower() not in IGNORE_HEADERS}
+    if r.status == 204:
+        hdrs.pop("content-length", None)  # hyper omite content-length:0 en 204 (framing ratificado)
     conn.close()
     return {"status": r.status, "headers": hdrs, "body": data}  # body = bytes (compara byte-exacto)
 

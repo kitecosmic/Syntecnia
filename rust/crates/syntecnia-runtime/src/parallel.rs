@@ -14,7 +14,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use syntecnia_capabilities::model::{Capability, CapabilitySet};
@@ -101,8 +101,11 @@ fn reconstruct_task(interp: &Interpreter, snap: &TaskSnapshot) -> SynValue {
     }
 }
 
-/// Corre `task` sobre `items` con un pool de `limit` hilos. Resultados en orden;
-/// fail-fast con el error de menor índice.
+/// A1 Fase 2 — Corre `task` sobre `items` con concurrencia `limit` sobre **tokio**
+/// (runtime multi-thread + `spawn_blocking` por item, acotado por un semáforo). Cada
+/// item corre en un intérprete sync fresco (modelo CSP). Resultados **en orden de
+/// entrada**; **fail-fast** con el error de menor índice. Semántica idéntica a `apply`
+/// secuencial; tokio sólo cambia el scheduling (M:N, escala a muchas tareas).
 #[allow(clippy::too_many_arguments)]
 fn run_parallel(
     globals: Arc<Vec<(String, GlobalVal)>>,
@@ -117,70 +120,74 @@ fn run_parallel(
     if n == 0 {
         return Ok(Vec::new());
     }
-    let workers = limit.max(1).min(n);
+    let limit = limit.max(1);
+    // Runtime acotado: el pool de blocking se topea al `limit` (concurrencia real de
+    // los intérpretes sync). El stack grande cubre la recursión del intérprete.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(limit)
+        .thread_stack_size(INTERP_STACK_SIZE)
+        .build()
+        .map_err(|e| RuntimeError::new(format!("parallel_map: no se pudo crear el runtime: {}", e)))?;
+
     let items = Arc::new(items);
-    let results: Arc<Vec<Mutex<Option<SendValue>>>> =
-        Arc::new((0..n).map(|_| Mutex::new(None)).collect());
-    let next = Arc::new(AtomicUsize::new(0));
     let aborted = Arc::new(AtomicBool::new(false));
     let error: Arc<Mutex<Option<(usize, RuntimeError)>>> = Arc::new(Mutex::new(None));
 
-    let mut handles = Vec::with_capacity(workers);
-    for _ in 0..workers {
-        let globals = globals.clone();
-        let granted = granted.clone();
-        let denied = denied.clone();
-        let task_snap = task_snap.clone();
-        let items = items.clone();
-        let results = results.clone();
-        let next = next.clone();
-        let aborted = aborted.clone();
-        let error = error.clone();
-        let handle = std::thread::Builder::new()
-            .stack_size(INTERP_STACK_SIZE)
-            .spawn(move || {
+    runtime.block_on(async move {
+        let sem = Arc::new(tokio::sync::Semaphore::new(limit));
+        let mut handles = Vec::with_capacity(n);
+        for i in 0..n {
+            // Acquire bloquea hasta que haya un slot libre → concurrencia ≤ limit.
+            let permit = match sem.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            if aborted.load(Ordering::Relaxed) {
+                drop(permit);
+                break;
+            }
+            let globals = globals.clone();
+            let granted = granted.clone();
+            let denied = denied.clone();
+            let task_snap = task_snap.clone();
+            let items = items.clone();
+            let aborted = aborted.clone();
+            let error = error.clone();
+            let h = tokio::task::spawn_blocking(move || -> Option<SendValue> {
+                let _permit = permit; // libera el slot al terminar
+                if aborted.load(Ordering::Relaxed) {
+                    return None;
+                }
                 let mut interp = build_worker_interp(&globals, &granted, &denied, secure);
                 let task_value = reconstruct_task(&interp, &task_snap);
-                loop {
-                    if aborted.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= items.len() {
-                        break;
-                    }
-                    let item = from_send(&items[i]);
-                    match interp.call_task(task_value.clone(), vec![item]) {
-                        Ok(v) => {
-                            *results[i].lock().unwrap() = Some(to_send(&v));
+                let item = from_send(&items[i]);
+                match interp.call_task(task_value, vec![item]) {
+                    Ok(v) => Some(to_send(&v)),
+                    Err(c) => {
+                        let re = control_to_error(c);
+                        let mut e = error.lock().unwrap();
+                        if e.as_ref().map_or(true, |(idx, _)| i < *idx) {
+                            *e = Some((i, re));
                         }
-                        Err(c) => {
-                            let re = control_to_error(c);
-                            let mut e = error.lock().unwrap();
-                            if e.as_ref().map_or(true, |(idx, _)| i < *idx) {
-                                *e = Some((i, re));
-                            }
-                            aborted.store(true, Ordering::Relaxed);
-                            break;
-                        }
+                        aborted.store(true, Ordering::Relaxed);
+                        None
                     }
                 }
-            })
-            .expect("no se pudo crear el hilo worker");
-        handles.push(handle);
-    }
-    for h in handles {
-        let _ = h.join();
-    }
+            });
+            handles.push(h);
+        }
 
-    if let Some((_, re)) = error.lock().unwrap().take() {
-        return Err(re);
-    }
-    let out = results
-        .iter()
-        .map(|m| m.lock().unwrap().clone().unwrap_or(SendValue::Nothing))
-        .collect();
-    Ok(out)
+        // Resultados en orden de entrada (handles en orden 0..n).
+        let mut out: Vec<SendValue> = Vec::with_capacity(handles.len());
+        for h in handles {
+            out.push(h.await.ok().flatten().unwrap_or(SendValue::Nothing));
+        }
+        if let Some((_, re)) = error.lock().unwrap().take() {
+            return Err(re);
+        }
+        Ok(out)
+    })
 }
 
 /// Registra `parallel_map` y `chunk` (lo llama `wire_common`).

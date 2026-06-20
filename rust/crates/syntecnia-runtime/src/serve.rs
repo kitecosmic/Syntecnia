@@ -386,6 +386,17 @@ fn build_host_table(
                 }
             };
 
+            // Reverse proxy (Lote 2): body == `proxy to <url>` → forwardea al upstream.
+            let proxy_target: Option<String> = if body.len() == 1 {
+                if let NodeKind::ProxyStatement { target } = &body[0].kind {
+                    Some(interp.eval(target, env)?.to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let body_c = body.clone();
             let swarm_c = swarm.clone();
             let snap_c = snapshot.clone();
@@ -416,6 +427,7 @@ fn build_host_table(
                 rate_zone: zone,
                 handler,
                 stream_handler,
+                proxy_target,
             });
         }
     }

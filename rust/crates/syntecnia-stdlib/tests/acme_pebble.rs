@@ -213,8 +213,9 @@ fn acme_http01_end_to_end_against_pebble() {
         text
     );
     assert!(text.contains("hola acme"), "no llegó el body sobre HTTPS: {}", text);
+    // hyper escribe header names en minúscula → chequeo case-insensitive.
     assert!(
-        text.contains("Strict-Transport-Security"),
+        text.to_lowercase().contains("strict-transport-security"),
         "falta HSTS sobre HTTPS: {}",
         text
     );

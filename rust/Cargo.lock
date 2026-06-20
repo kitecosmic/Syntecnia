@@ -406,6 +406,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -1135,13 +1136,18 @@ dependencies = [
  "syntecnia-core",
  "syntecnia-llm",
  "syntecnia-stdlib",
+ "tokio",
 ]
 
 [[package]]
 name = "syntecnia-stdlib"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "flate2",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "indexmap",
  "instant-acme",
  "rcgen 0.13.2",
@@ -1152,6 +1158,7 @@ dependencies = [
  "syntecnia-capabilities",
  "syntecnia-core",
  "tokio",
+ "tokio-rustls",
  "winreg",
 ]
 
